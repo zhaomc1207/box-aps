@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+.vscode/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs
+*.log
+
+# Outputs
+outputs/
+
+# Environment variables
+.env
+.env.*
+
+# System files
+.DS_Store__pycache__/
+*.py[cod]
+.venv/
+venv/
+outputs/*
+!outputs/README.md
+*.log
+*.lp
+*.mps
+*.sol
+*.prm

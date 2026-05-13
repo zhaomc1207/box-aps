@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: box-aps-milp
+Version: 0.1.0
+Summary: BOX APS data preprocessing and Gurobi MILP model
+Requires-Python: >=3.10
+Requires-Dist: pandas>=2.0
+Requires-Dist: openpyxl>=3.1
+Requires-Dist: gurobipy>=10.0

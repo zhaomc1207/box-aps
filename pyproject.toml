@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "box-aps-milp"
+version = "0.1.0"
+description = "BOX APS data preprocessing and Gurobi MILP model"
+requires-python = ">=3.10"
+dependencies = [
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "gurobipy>=10.0",
+]
+
+[project.scripts]
+box-aps-milp = "box_aps_milp.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["box_aps_milp*"]
