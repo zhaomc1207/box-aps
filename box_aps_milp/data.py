@@ -52,6 +52,7 @@ OPTIONAL_SHEETS = [
     "aps_schedule_demand_reserve_input",
     "aps_merge_priority_setting",
     "aps_schedule_merge_priority_setting",
+    "aps_schedule_cycle_merge_setting",
 ]
 
 
@@ -59,6 +60,7 @@ TABLE_FILES = {
     "raw_demands": "raw_demands.csv",
     "demands": "demands.csv",
     "merge_map": "merge_map.csv",
+    "cycle_merge_map": "cycle_merge_map.csv",
     "lines": "lines.csv",
     "slots": "slots.csv",
     "line_slots": "line_slots.csv",
@@ -114,6 +116,7 @@ class ProcessedData:
     order_keys: pd.DataFrame
     raw_demands: pd.DataFrame = field(default_factory=pd.DataFrame)
     merge_map: pd.DataFrame = field(default_factory=pd.DataFrame)
+    cycle_merge_map: pd.DataFrame = field(default_factory=pd.DataFrame)
     issues: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     def save(self, output_dir: str | Path) -> None:
@@ -143,6 +146,7 @@ def load_processed_data(input_dir: str | Path) -> ProcessedData:
     tables["raw_demands"] = _restore_numeric(tables["raw_demands"], ["qty", "priority_rank", "priority_weight", "total_index"])
     tables["demands"] = _restore_numeric(tables["demands"], ["qty", "priority_rank", "priority_weight"])
     tables["merge_map"] = _restore_numeric(tables["merge_map"], ["raw_qty", "member_rank", "merge_applied"])
+    tables["cycle_merge_map"] = _restore_numeric(tables["cycle_merge_map"], ["member_rank", "merge_applied"])
     for col in ["mr_day_dt", "ots_date_dt", "fpsd_dt", "ship_day_two_dt", "reference_date"]:
         if col in tables["raw_demands"].columns:
             tables["raw_demands"][col] = pd.to_datetime(tables["raw_demands"][col], errors="coerce")
@@ -201,7 +205,7 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
 
     raw_demands = _build_demands(sheets, slots, config, issues)
     merge_excluded = _merge_excluded_demand_ids(sheets, raw_demands)
-    demands, merge_map, merge_trace = _apply_merge_priority(sheets, raw_demands, merge_excluded, issues)
+    demands, merge_map, cycle_merge_map, merge_trace = _apply_merge_priority(sheets, raw_demands, merge_excluded, issues)
     logger.info(
         "preprocess:demands raw=%s merged=%s merge_map=%s excluded=%s",
         len(raw_demands),
@@ -303,6 +307,10 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
             "merge_priority_sheet": str(merge_trace.get("merge_source_table", "none")),
             "merge_priority_loaded": bool(str(merge_trace.get("merge_source_table", "none")) != "none"),
             "merge_priority_applied": bool(merge_applied_raw > 0),
+            "cycle_merge_enabled": bool(merge_trace.get("cycle_merge_enabled", False)),
+            "cycle_merge_source_table": str(merge_trace.get("cycle_merge_source_table", "none")),
+            "cycle_merge_hit_rules": int(merge_trace.get("cycle_merge_hit_rules", 0)),
+            "merge_execution_order": str(merge_trace.get("merge_execution_order", "priority_then_cycle")),
         },
         "counts": {
             "raw_demands": int(len(raw_demands)),
@@ -326,6 +334,7 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         raw_demands=raw_demands,
         demands=demands,
         merge_map=merge_map,
+        cycle_merge_map=cycle_merge_map,
         lines=lines,
         slots=slots,
         line_slots=line_slots,
@@ -766,7 +775,7 @@ def _apply_merge_priority(
     raw_demands: pd.DataFrame,
     excluded_ids: set[str],
     issues: list[dict[str, Any]],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     if raw_demands.empty:
         empty_map = pd.DataFrame(
             columns=[
@@ -777,14 +786,29 @@ def _apply_merge_priority(
                 "raw_qty",
                 "merge_source_table",
                 "merge_key_snapshot",
+                "merge_type",
             ]
         )
-        return raw_demands.copy(), empty_map, {"merge_source_table": "none"}
+        empty_cycle = pd.DataFrame(
+            columns=[
+                "raw_demand_id",
+                "merged_demand_id",
+                "member_rank",
+                "cycle_merge_rule_id",
+                "cycle_merge_key_snapshot",
+                "cycle_merge_source_table",
+                "merge_type",
+            ]
+        )
+        return raw_demands.copy(), empty_map, empty_cycle, {"merge_source_table": "none", "cycle_merge_source_table": "none", "cycle_merge_enabled": False, "cycle_merge_hit_rules": 0, "merge_execution_order": "priority_then_cycle"}
 
     demands = raw_demands.copy()
     demands["demand_id"] = demands["demand_id"].astype(str)
     demands["_merged_demand_id"] = demands["demand_id"]
     demands["_merge_key_snapshot"] = ""
+    demands["_merge_type"] = "none"
+    demands["_cycle_merge_rule_id"] = ""
+    demands["_cycle_merge_key_snapshot"] = ""
 
     source_table = "none"
     rules = pd.DataFrame()
@@ -798,8 +822,23 @@ def _apply_merge_priority(
         source_table = "aps_merge_priority_setting"
 
     if rules.empty:
-        merge_map = _build_merge_map(demands, merge_source_table=source_table, merge_key_snapshot_col="_merge_key_snapshot")
-        return demands.drop(columns=["_merged_demand_id", "_merge_key_snapshot"], errors="ignore"), merge_map, {"merge_source_table": source_table}
+        demands, cycle_trace = _apply_cycle_merge(sheets, demands, excluded_ids, issues)
+        merge_map = _build_merge_map(
+            demands,
+            merge_source_table=source_table,
+            merge_key_snapshot_col="_merge_key_snapshot",
+            merge_type_col="_merge_type",
+        )
+        cycle_map = _build_cycle_merge_map(demands, cycle_trace.get("cycle_merge_source_table", "none"))
+        merged_demands = _aggregate_merged_demands(demands, merge_map, issues)
+        trace = {
+            "merge_source_table": source_table,
+            "cycle_merge_source_table": cycle_trace.get("cycle_merge_source_table", "none"),
+            "cycle_merge_enabled": bool(cycle_trace.get("cycle_merge_enabled", False)),
+            "cycle_merge_hit_rules": int(cycle_trace.get("cycle_merge_hit_rules", 0)),
+            "merge_execution_order": "priority_then_cycle",
+        }
+        return merged_demands, merge_map, cycle_map, trace
 
     for col in ["mcode", "plant", "priority_desc"]:
         if col not in rules.columns:
@@ -839,14 +878,25 @@ def _apply_merge_priority(
             demands.loc[indices, "_merge_key_snapshot"] = "|".join(
                 f"{field}={value}" for field, value in zip(key_fields, key)
             )
+            demands.loc[indices, "_merge_type"] = "priority_merge"
 
+    demands, cycle_trace = _apply_cycle_merge(sheets, demands, excluded_ids, issues)
     merge_map = _build_merge_map(
         demands,
         merge_source_table=source_table,
         merge_key_snapshot_col="_merge_key_snapshot",
+        merge_type_col="_merge_type",
     )
+    cycle_map = _build_cycle_merge_map(demands, cycle_trace.get("cycle_merge_source_table", "none"))
     merged_demands = _aggregate_merged_demands(demands, merge_map, issues)
-    return merged_demands, merge_map, {"merge_source_table": source_table}
+    trace = {
+        "merge_source_table": source_table,
+        "cycle_merge_source_table": cycle_trace.get("cycle_merge_source_table", "none"),
+        "cycle_merge_enabled": bool(cycle_trace.get("cycle_merge_enabled", False)),
+        "cycle_merge_hit_rules": int(cycle_trace.get("cycle_merge_hit_rules", 0)),
+        "merge_execution_order": "priority_then_cycle",
+    }
+    return merged_demands, merge_map, cycle_map, trace
 
 
 def _merge_stage_fields(rules: pd.DataFrame, issues: list[dict[str, Any]]) -> list[str]:
@@ -890,10 +940,128 @@ def _make_merged_demand_id(raw_ids: list[str], mcode: str) -> str:
     return f"MRG::{prefix}::{digest}"
 
 
+def _apply_cycle_merge(
+    sheets: dict[str, pd.DataFrame],
+    demands_with_assignment: pd.DataFrame,
+    excluded_ids: set[str],
+    issues: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    rules = sheets.get("aps_schedule_cycle_merge_setting", pd.DataFrame())
+    if rules is None or rules.empty:
+        return demands_with_assignment, {"cycle_merge_enabled": False, "cycle_merge_source_table": "none", "cycle_merge_hit_rules": 0}
+
+    out = demands_with_assignment.copy()
+    for col in ["mcode", "plant", "_merge_type", "_cycle_merge_rule_id", "_cycle_merge_key_snapshot"]:
+        if col not in out.columns:
+            out[col] = ""
+    out["mcode"] = out["mcode"].fillna("").astype(str).str.strip()
+    out["plant"] = out.get("plant", "").fillna("").astype(str).str.strip()
+
+    rules = rules.copy()
+    for col in ["rule_id", "mcode", "plant", "merge_fields", "priority_desc", "code"]:
+        if col not in rules.columns:
+            rules[col] = ""
+        rules[col] = rules[col].fillna("").astype(str).str.strip()
+    rules["priority"] = _safe_numeric(rules.get("priority", 0)).astype(int)
+    rules = rules.sort_values(["mcode", "plant", "priority", "code", "rule_id"]).reset_index(drop=True)
+
+    hit_rules = 0
+    for rule in rules.itertuples(index=False):
+        rule_id = str(getattr(rule, "rule_id", "") or "")
+        mcode = str(getattr(rule, "mcode", "") or "")
+        plant = str(getattr(rule, "plant", "") or "")
+        merge_fields_text = str(getattr(rule, "merge_fields", "") or "")
+        if merge_fields_text:
+            stage_fields = [f.strip() for f in merge_fields_text.split(",") if f.strip()]
+        else:
+            one_rule = pd.DataFrame([{"priority_desc": str(getattr(rule, "priority_desc", "") or "")}])
+            stage_fields = _merge_stage_fields(one_rule, issues)
+        if not stage_fields:
+            continue
+
+        mask = ~out["demand_id"].astype(str).isin(excluded_ids)
+        mask &= out["demand_id"].astype(str).eq(out["_merged_demand_id"].astype(str))
+        if mcode:
+            mask &= out["mcode"].astype(str).eq(mcode)
+        if plant:
+            mask &= out["plant"].astype(str).eq(plant)
+        candidates = out[mask].copy()
+        if len(candidates) <= 1:
+            continue
+
+        key_fields = [field for field in stage_fields if field in candidates.columns]
+        if not key_fields:
+            continue
+        keys = candidates.apply(lambda row: _merge_key(row, key_fields), axis=1)
+        grouped_indices: dict[tuple[str, ...], list[int]] = {}
+        for idx, key in zip(candidates.index.tolist(), keys.tolist()):
+            grouped_indices.setdefault(key, []).append(idx)
+
+        rule_hit = False
+        for key, indices in grouped_indices.items():
+            if len(indices) <= 1:
+                continue
+            merged_id = _make_merged_demand_id(candidates.loc[indices, "demand_id"].astype(str).tolist(), mcode)
+            out.loc[indices, "_merged_demand_id"] = merged_id
+            out.loc[indices, "_merge_type"] = "cycle_merge"
+            out.loc[indices, "_cycle_merge_rule_id"] = rule_id
+            out.loc[indices, "_cycle_merge_key_snapshot"] = "|".join(
+                f"{field}={value}" for field, value in zip(key_fields, key)
+            )
+            if out.loc[indices, "_merge_key_snapshot"].fillna("").astype(str).str.strip().eq("").all():
+                out.loc[indices, "_merge_key_snapshot"] = out.loc[indices, "_cycle_merge_key_snapshot"]
+            rule_hit = True
+        if rule_hit:
+            hit_rules += 1
+
+    return out, {
+        "cycle_merge_enabled": True,
+        "cycle_merge_source_table": "aps_schedule_cycle_merge_setting",
+        "cycle_merge_hit_rules": int(hit_rules),
+    }
+
+
+def _build_cycle_merge_map(demands_with_assignment: pd.DataFrame, source_table: str) -> pd.DataFrame:
+    if demands_with_assignment.empty:
+        return pd.DataFrame(
+            columns=[
+                "raw_demand_id",
+                "merged_demand_id",
+                "member_rank",
+                "cycle_merge_rule_id",
+                "cycle_merge_key_snapshot",
+                "cycle_merge_source_table",
+                "merge_type",
+            ]
+        )
+    out = demands_with_assignment.copy()
+    out["raw_demand_id"] = out["demand_id"].astype(str)
+    out["merged_demand_id"] = out["_merged_demand_id"].astype(str)
+    out["merge_type"] = out.get("_merge_type", "none").fillna("none").astype(str)
+    out["cycle_merge_rule_id"] = out.get("_cycle_merge_rule_id", "").fillna("").astype(str)
+    out["cycle_merge_key_snapshot"] = out.get("_cycle_merge_key_snapshot", "").fillna("").astype(str)
+    out["cycle_merge_source_table"] = str(source_table or "none")
+    out["_member_rank"] = pd.to_numeric(out.get("total_index", pd.NA), errors="coerce").fillna(10**9).astype(int)
+    out = out.sort_values(["merged_demand_id", "_member_rank", "raw_demand_id"]).reset_index(drop=True)
+    out["member_rank"] = out.groupby("merged_demand_id").cumcount() + 1
+    return out[
+        [
+            "raw_demand_id",
+            "merged_demand_id",
+            "member_rank",
+            "cycle_merge_rule_id",
+            "cycle_merge_key_snapshot",
+            "cycle_merge_source_table",
+            "merge_type",
+        ]
+    ]
+
+
 def _build_merge_map(
     demands_with_assignment: pd.DataFrame,
     merge_source_table: str = "none",
     merge_key_snapshot_col: str = "_merge_key_snapshot",
+    merge_type_col: str = "_merge_type",
 ) -> pd.DataFrame:
     base = demands_with_assignment.copy()
     base["raw_demand_id"] = base["demand_id"].astype(str)
@@ -903,6 +1071,10 @@ def _build_merge_map(
         base["merge_key_snapshot"] = base[merge_key_snapshot_col].fillna("").astype(str)
     else:
         base["merge_key_snapshot"] = ""
+    if merge_type_col in base.columns:
+        base["merge_type"] = base[merge_type_col].fillna("none").astype(str)
+    else:
+        base["merge_type"] = "none"
     base["merge_source_table"] = str(merge_source_table or "none")
     base["_member_rank"] = (
         pd.to_numeric(base.get("total_index", pd.NA), errors="coerce")
@@ -922,6 +1094,7 @@ def _build_merge_map(
             "raw_qty",
             "merge_source_table",
             "merge_key_snapshot",
+            "merge_type",
         ]
     ]
 
@@ -942,7 +1115,15 @@ def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame
         row: dict[str, Any] = {"demand_id": str(merged_id)}
         mixed_fields: list[str] = []
         for col in group.columns:
-            if col.startswith("_") or col in {"demand_id", "merge_applied", "member_rank", "raw_qty"}:
+            if col.startswith("_") or col in {
+                "demand_id",
+                "merge_applied",
+                "member_rank",
+                "raw_qty",
+                "merge_source_table",
+                "merge_key_snapshot",
+                "merge_type",
+            }:
                 continue
             if col == "qty":
                 row[col] = int(pd.to_numeric(group[col], errors="coerce").fillna(0).sum())
