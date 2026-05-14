@@ -14,12 +14,17 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import hashlib
+import logging
 from pathlib import Path
 from typing import Any, Iterable
 import json
 import math
+import time
 
 import pandas as pd
+
+
+logger = logging.getLogger(__name__)
 
 
 REQUIRED_SHEETS = [
@@ -171,20 +176,38 @@ def load_processed_data(input_dir: str | Path) -> ProcessedData:
 
 
 def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None = None) -> ProcessedData:
+    t0 = time.perf_counter()
+    logger.info("preprocess:start input=%s", Path(input_xlsx).resolve())
     config = config or PreprocessConfig()
     sheets = read_input_workbook(input_xlsx)
+    logger.info("preprocess:read_workbook sheets=%s", len(sheets))
     sheets = _filter_versions(sheets, config)
     issues: list[dict[str, Any]] = []
 
     preliminary_line_slots, preliminary_slots = _build_slots_and_line_slots(sheets, config)
     start_ts, end_ts = _resolve_horizon(preliminary_slots, config)
+    logger.info(
+        "preprocess:horizon start=%s end=%s prelim_slots=%s prelim_line_slots=%s",
+        start_ts,
+        end_ts,
+        len(preliminary_slots),
+        len(preliminary_line_slots),
+    )
     sheets = _filter_horizon(sheets, start_ts, end_ts)
     line_slots, slots = _build_slots_and_line_slots(sheets, config)
     lines = _build_lines(sheets, line_slots)
+    logger.info("preprocess:calendar lines=%s slots=%s line_slots=%s", len(lines), len(slots), len(line_slots))
 
     raw_demands = _build_demands(sheets, slots, config, issues)
     merge_excluded = _merge_excluded_demand_ids(sheets, raw_demands)
     demands, merge_map = _apply_merge_priority(sheets, raw_demands, merge_excluded, issues)
+    logger.info(
+        "preprocess:demands raw=%s merged=%s merge_map=%s excluded=%s",
+        len(raw_demands),
+        len(demands),
+        len(merge_map),
+        len(merge_excluded),
+    )
     uph = _normalize_uph(sheets.get("aps_schedule_uph_input", pd.DataFrame()))
     line_slots = _apply_downtime(line_slots, sheets.get("aps_schedule_off_time_input", pd.DataFrame()))
     # v7_2: rule 7 capacity reservation. Reads optional aps_schedule_reserver_input and
@@ -199,6 +222,13 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
     adjust_locks, external_adjust = _split_adjust_schedule(sheets, demands, slots, issues)
     occupied = _build_external_occupation(external_adjust, uph, issues)
     line_slots = _apply_external_occupation(line_slots, occupied)
+    logger.info(
+        "preprocess:locks fixed=%s adjust=%s external_adjust=%s external_occupied_slots=%s",
+        len(fixed_locks),
+        len(adjust_locks),
+        len(external_adjust),
+        len(occupied),
+    )
 
     triples = _build_sparse_triples(
         demands=demands,
@@ -235,6 +265,12 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         adjust_locks,
     ) = _apply_day_buckets(triples, line_slots, slots, fixed_locks, adjust_locks, config)
     bucketed_triples = int(len(triples))
+    logger.info(
+        "preprocess:triples raw=%s pruned=%s bucketed=%s",
+        raw_triples,
+        pruned_triples,
+        bucketed_triples,
+    )
     merge_applied_series = (
         pd.to_numeric(merge_map["merge_applied"], errors="coerce").fillna(0).astype(int)
         if len(merge_map) and "merge_applied" in merge_map.columns
@@ -283,7 +319,7 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         },
     }
 
-    return ProcessedData(
+    out = ProcessedData(
         config=config,
         metadata=metadata,
         raw_demands=raw_demands,
@@ -301,6 +337,8 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         order_keys=order_keys,
         issues=pd.DataFrame(issues),
     )
+    logger.info("preprocess:done elapsed_sec=%.3f issues=%s", time.perf_counter() - t0, len(out.issues))
+    return out
 
 
 def read_input_workbook(input_xlsx: str | Path) -> dict[str, pd.DataFrame]:
@@ -1761,13 +1799,17 @@ def _priority_condition_hits(demand: Any, rule: pd.Series, ref_date: pd.Timestam
         return bool(int(getattr(demand, key_norm, 0) or 0))
     if key_norm in {"ots_date", "fpsd", "ship_day_two"}:
         dt = getattr(demand, f"{key_norm}_dt", pd.NaT)
-        if pd.isna(dt):
+        dt_parsed = pd.to_datetime(dt, errors="coerce")
+        if pd.isna(dt_parsed):
             return False
+        ref_ts = pd.to_datetime(ref_date, errors="coerce")
+        if pd.isna(ref_ts):
+            raise ValueError(f"Invalid ref_date for priority evaluation: {ref_date!r}")
         try:
             offset = int(float(value))
         except ValueError:
             return False
-        days = (pd.Timestamp(dt).normalize() - ref_date).days
+        days = (pd.Timestamp(dt_parsed).normalize() - pd.Timestamp(ref_ts).normalize()).days
         if ctype == 3:
             return days == offset
         if ctype == 2:
@@ -1775,7 +1817,8 @@ def _priority_condition_hits(demand: Any, rule: pd.Series, ref_date: pd.Timestam
         if ctype == 5:
             return days <= offset
         return days == offset
-    actual = str(getattr(demand, key, "") or "")
+    raw_actual = getattr(demand, key, "")
+    actual = "" if pd.isna(raw_actual) else str(raw_actual)
     if value in {"", "*", "X"}:
         return _truthy(actual) if value == "X" else True
     return actual == value
