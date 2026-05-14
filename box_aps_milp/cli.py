@@ -179,7 +179,8 @@ def _main(argv: list[str] | None = None) -> int:
         else:
             parser.error("solve requires either --input or --processed")
         _print_summary(data)
-        solution, summary = _solve_pipeline(data, args)
+        model, solution, summary = _solve_pipeline(data, args)
+        _write_lock_diagnostics(model, Path(args.summary).resolve().parent if args.summary else Path(args.output).resolve().parent)
         if args.summary:
             _write_json(args.summary, summary)
         output = Path(args.output)
@@ -222,7 +223,8 @@ def _main(argv: list[str] | None = None) -> int:
         _print_summary(data)
         logging.info("run-all preprocess output=%s counts=%s", Path(args.processed).resolve(), data.metadata.get("counts", {}))
 
-        solution, summary = _solve_pipeline(data, args)
+        model, solution, summary = _solve_pipeline(data, args)
+        _write_lock_diagnostics(model, Path(args.processed).resolve())
         solution_path = Path(args.solution)
         solution_path.parent.mkdir(parents=True, exist_ok=True)
         solution.to_csv(solution_path, index=False, encoding="utf-8-sig")
@@ -342,12 +344,22 @@ def _model_config_from_args(args: argparse.Namespace) -> ModelConfig:
     )
 
 
-def _solve_pipeline(data, args: argparse.Namespace) -> tuple[pd.DataFrame, dict]:
+def _solve_pipeline(data, args: argparse.Namespace):
     model_config = _model_config_from_args(args)
     model, solution, summary = _solve_with_optional_fai_repair(data, model_config, max(args.fai_repair_iterations, 0))
     second_stage = run_second_stage(solution, data)
     summary["second_stage"] = second_stage.report
-    return second_stage.solution, summary
+    return model, second_stage.solution, summary
+
+
+def _write_lock_diagnostics(model, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    lock_balance = getattr(model, "_aps_lock_balance", None)
+    if isinstance(lock_balance, pd.DataFrame) and len(lock_balance):
+        lock_balance.to_csv(output_dir / "lock_balance.csv", index=False, encoding="utf-8-sig")
+    lock_details = getattr(model, "_aps_lock_details", None)
+    if isinstance(lock_details, pd.DataFrame) and len(lock_details):
+        lock_details.to_csv(output_dir / "lock_details.csv", index=False, encoding="utf-8-sig")
 
 
 def _solve_with_optional_fai_repair(data, model_config: ModelConfig, fai_repair_iterations: int):
@@ -490,6 +502,9 @@ def _solver_summary(model, data) -> dict:
     runtime_issues = getattr(model, "_aps_runtime_issues", []) or []
     if runtime_issues:
         summary["runtime_issues"] = list(runtime_issues)
+    lock_overview = getattr(model, "_aps_lock_overview", None)
+    if isinstance(lock_overview, dict):
+        summary["lock_overview"] = dict(lock_overview)
     return summary
 
 

@@ -75,17 +75,26 @@ def build_gurobi_model(data: ProcessedData, config: ModelConfig | None = None):
     if triples.empty:
         raise ValueError("No eligible (demand, line, slot) triples were generated.")
 
+    lock_details, lock_balance, lock_overview, lock_issues = _prepare_lock_diagnostics(
+        demands=demands,
+        fixed_locks=data.fixed_locks,
+        adjust_locks=data.adjust_locks,
+    )
+    runtime_issues.extend(lock_issues)
+    if config.strict_locks:
+        _assert_lock_balance_feasible(lock_balance)
     locked_schedule = pd.DataFrame()
     if config.strict_locks and config.eliminate_locks:
-        locked_schedule = _build_locked_schedule(data, triples)
+        lock_active = lock_details[lock_details["active_lock_flag"].astype(int) == 1].copy() if len(lock_details) else pd.DataFrame()
+        locked_schedule = _build_locked_schedule(data, triples, lock_active)
         if len(locked_schedule):
             _log_lock_uph_fallbacks(locked_schedule, runtime_issues)
             line_slots = _subtract_locked_capacity(line_slots, locked_schedule)
-            locked_demands = set(locked_schedule["demand_id"].astype(str))
-            demands = demands[~demands["demand_id"].astype(str).isin(locked_demands)].copy()
-            triples = triples[~triples["demand_id"].astype(str).isin(locked_demands)].copy()
+            demands = _apply_remaining_qty(demands, lock_balance)
+            remaining_demands = set(demands["demand_id"].astype(str))
+            triples = triples[triples["demand_id"].astype(str).isin(remaining_demands)].copy()
             data_fai_arcs = data.fai_arcs[
-                ~data.fai_arcs["rest_demand_id"].astype(str).isin(locked_demands)
+                data.fai_arcs["rest_demand_id"].astype(str).isin(remaining_demands)
             ].copy()
         else:
             data_fai_arcs = data.fai_arcs.copy()
@@ -221,8 +230,8 @@ def build_gurobi_model(data: ProcessedData, config: ModelConfig | None = None):
         )
 
     if config.strict_locks and not config.eliminate_locks:
-        _add_lock_constraints(model, x, triples_by_d, data.fixed_locks, demand_qty, "fix")
-        _add_lock_constraints(model, x, triples_by_d, data.adjust_locks, demand_qty, "adjust")
+        lock_active = lock_details[lock_details["active_lock_flag"].astype(int) == 1].copy() if len(lock_details) else pd.DataFrame()
+        _add_lock_constraints(model, x, triples_by_d, lock_active, "locks")
 
     # 8.11 FAI first/rest precedence.
     if config.enforce_fai_with_big_m and config.use_activation_binaries:
@@ -321,7 +330,29 @@ def build_gurobi_model(data: ProcessedData, config: ModelConfig | None = None):
         "h": h,
         "setup": setup,
     }
+    lock_balance_out = lock_balance.copy()
+    lock_balance_out["over_locked_flag"] = (
+        pd.to_numeric(lock_balance_out["locked_qty_total"], errors="coerce").fillna(0.0)
+        > pd.to_numeric(lock_balance_out["original_qty"], errors="coerce").fillna(0.0) + 1e-6
+    ).astype(int)
+    lock_details_out = lock_details.copy()
+    if len(lock_details_out):
+        occ = {}
+        if len(locked_schedule):
+            occ = locked_schedule.set_index(["demand_id", "line_id", "slot_id", "source", "seq"])["occupied_hours"].astype(float).to_dict()
+        lock_details_out["occupied_hours"] = [
+            float(occ.get((str(r.demand_id), str(r.line_id), str(r.slot_id), str(r.source), int(r.seq)), 0.0))
+            for r in lock_details_out.itertuples(index=False)
+        ]
+        lock_details_out = lock_details_out.merge(
+            lock_balance_out[["demand_id", "original_qty", "locked_qty_total", "remaining_qty"]],
+            on="demand_id",
+            how="left",
+        )
     model._aps_locked_schedule = locked_schedule
+    model._aps_lock_balance = lock_balance_out
+    model._aps_lock_details = lock_details_out
+    model._aps_lock_overview = lock_overview
     model._aps_data_fai_arcs = data_fai_arcs
     model._aps_runtime_issues = runtime_issues
     model._aps_config = config
@@ -462,21 +493,22 @@ def _expand_merged_solution_rows(result: pd.DataFrame, data: ProcessedData) -> p
     return expanded.drop(columns=["_sort_shift_start", "_sort_schedule_qty", "_row_order"], errors="ignore")
 
 
-def _build_locked_schedule(data: ProcessedData, triples: pd.DataFrame) -> pd.DataFrame:
-    locks = []
-    for source, frame in [("fix", data.fixed_locks), ("adjust", data.adjust_locks)]:
-        if frame.empty:
-            continue
-        tmp = frame.copy()
-        tmp["source"] = source
-        locks.append(tmp)
-    if not locks:
+def _build_locked_schedule(data: ProcessedData, triples: pd.DataFrame, lock_rows: pd.DataFrame | None = None) -> pd.DataFrame:
+    if lock_rows is None:
+        locks = []
+        for source, frame in [("fix", data.fixed_locks), ("adjust", data.adjust_locks)]:
+            if frame.empty:
+                continue
+            tmp = frame.copy()
+            tmp["source"] = source
+            locks.append(tmp)
+        lock_rows = pd.concat(locks, ignore_index=True) if locks else pd.DataFrame()
+    if lock_rows is None or lock_rows.empty:
         return pd.DataFrame(columns=["demand_id", "line_id", "slot_id", "schedule_qty", "uph", "occupied_hours", "source", "seq"])
-    lock_rows = pd.concat(locks, ignore_index=True)
     source_rank = {"fix": 0, "adjust": 1}
-    lock_rows["_source_rank"] = lock_rows["source"].map(source_rank).fillna(9)
-    lock_rows = lock_rows.sort_values(["demand_id", "_source_rank", "seq"]).drop_duplicates("demand_id")
-    demand_qty = data.demands.set_index("demand_id")["qty"].astype(float).to_dict()
+    lock_rows = lock_rows.copy()
+    lock_rows["_source_rank"] = lock_rows.get("source", pd.Series("", index=lock_rows.index)).map(source_rank).fillna(9)
+    lock_rows = lock_rows.sort_values(["demand_id", "_source_rank", "seq"])
     triples_uph = triples.set_index(["demand_id", "line_id", "slot_id"])["uph"].astype(float).to_dict()
     # v7_1: build multi-level UPH fallbacks so locked occupation is rarely zero.
     uph_by_demand_line, uph_by_demand = _build_lock_uph_fallbacks(triples)
@@ -484,7 +516,7 @@ def _build_locked_schedule(data: ProcessedData, triples: pd.DataFrame) -> pd.Dat
     rows = []
     for row in lock_rows.itertuples(index=False):
         key = (str(row.demand_id), str(row.line_id), str(row.slot_id))
-        qty = float(demand_qty.get(str(row.demand_id), getattr(row, "lock_qty", 0.0)) or 0.0)
+        qty = float(getattr(row, "lock_qty", 0.0) or 0.0)
         if qty <= 0.0:
             continue
         matched_uph = float(triples_uph.get(key, 0.0) or 0.0)
@@ -515,6 +547,8 @@ def _build_locked_schedule(data: ProcessedData, triples: pd.DataFrame) -> pd.Dat
                 "seq": int(getattr(row, "seq", 0) or 0),
                 "uph_source": uph_source,
                 "model": demand_model.get(key[0], ""),
+                "lock_id": str(getattr(row, "lock_id", "") or ""),
+                "source_row_id": str(getattr(row, "source_row_id", "") or ""),
             }
         )
     return pd.DataFrame(
@@ -530,6 +564,8 @@ def _build_locked_schedule(data: ProcessedData, triples: pd.DataFrame) -> pd.Dat
             "seq",
             "uph_source",
             "model",
+            "lock_id",
+            "source_row_id",
         ],
     )
 
@@ -730,16 +766,224 @@ def _date_kappa(
     return out
 
 
-def _add_lock_constraints(model, x, triples_by_d, locks: pd.DataFrame, demand_qty: dict[str, float], label: str) -> None:
+def _add_lock_constraints(model, x, triples_by_d, locks: pd.DataFrame, label: str) -> None:
     if locks.empty:
         return
     for row in locks.itertuples(index=False):
         target = (str(row.demand_id), str(row.line_id), str(row.slot_id))
-        for key in triples_by_d.get(str(row.demand_id), []):
-            if key == target:
-                model.addConstr(x[key] == demand_qty[str(row.demand_id)], name=f"{label}_lock[{_key_name(key)}]")
-            else:
-                model.addConstr(x[key] == 0, name=f"{label}_zero[{_key_name(key)}]")
+        if target not in triples_by_d.get(str(row.demand_id), []):
+            continue
+        lock_qty = float(getattr(row, "lock_qty", 0.0) or 0.0)
+        if lock_qty <= 0.0:
+            continue
+        model.addConstr(x[target] >= lock_qty, name=f"{label}_lb[{_key_name(target)}]")
+
+
+def _prepare_lock_diagnostics(
+    demands: pd.DataFrame,
+    fixed_locks: pd.DataFrame,
+    adjust_locks: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float], list[dict[str, Any]]]:
+    issues: list[dict[str, Any]] = []
+    demand_qty = demands.set_index("demand_id")["qty"].astype(float).to_dict() if len(demands) else {}
+    frames: list[pd.DataFrame] = []
+    for source, frame in [("fix", fixed_locks), ("adjust", adjust_locks)]:
+        if frame.empty:
+            continue
+        tmp = frame.copy()
+        for col in ["lock_id", "source_row_id", "shift_date", "shift", "seq"]:
+            if col not in tmp.columns:
+                tmp[col] = ""
+        tmp["source"] = source
+        for col in ["demand_id", "line_id", "slot_id", "lock_id", "source_row_id", "shift_date", "shift"]:
+            if col in tmp.columns:
+                tmp[col] = tmp[col].fillna("").astype(str).str.strip()
+        tmp["seq"] = pd.to_numeric(tmp["seq"], errors="coerce").fillna(10**9).astype(int)
+        tmp["lock_qty"] = pd.to_numeric(tmp.get("lock_qty", 0), errors="coerce").fillna(0.0)
+        tmp = tmp[tmp["lock_qty"] > 0].copy()
+        if tmp.empty:
+            continue
+        biz_key = tmp["lock_id"].where(tmp["lock_id"].ne(""), tmp["source_row_id"])
+        tmp["dedup_key"] = (
+            tmp["demand_id"]
+            + "|"
+            + tmp["line_id"]
+            + "|"
+            + tmp["slot_id"]
+            + "|"
+            + tmp["shift_date"]
+            + "|"
+            + tmp["shift"]
+            + "|"
+            + tmp["lock_qty"].map(lambda v: f"{float(v):.6f}")
+            + "|"
+            + biz_key.fillna("").astype(str)
+            + "|"
+            + tmp["source"]
+        )
+        tmp["cross_source_key"] = (
+            tmp["demand_id"]
+            + "|"
+            + tmp["line_id"]
+            + "|"
+            + tmp["slot_id"]
+            + "|"
+            + tmp["shift_date"]
+            + "|"
+            + tmp["shift"]
+            + "|"
+            + tmp["lock_qty"].map(lambda v: f"{float(v):.6f}")
+        )
+        frames.append(
+            tmp[
+                [
+                    "source",
+                    "lock_id",
+                    "source_row_id",
+                    "demand_id",
+                    "line_id",
+                    "slot_id",
+                    "shift_date",
+                    "shift",
+                    "seq",
+                    "lock_qty",
+                    "dedup_key",
+                    "cross_source_key",
+                ]
+            ]
+        )
+    if not frames:
+        empty_details = pd.DataFrame(
+            columns=[
+                "source",
+                "lock_id",
+                "source_row_id",
+                "demand_id",
+                "line_id",
+                "slot_id",
+                "shift_date",
+                "shift",
+                "seq",
+                "lock_qty",
+                "dedup_key",
+                "duplicate_flag",
+                "issue_type",
+                "active_lock_flag",
+            ]
+        )
+        empty_balance = pd.DataFrame(columns=["demand_id", "original_qty", "locked_qty_total", "remaining_qty"])
+        overview = {
+            "fixed_locks": int(len(fixed_locks)),
+            "adjust_locks": int(len(adjust_locks)),
+            "duplicated_lock_rows": 0,
+            "over_locked_demands": 0,
+            "fully_locked_demands": 0,
+            "partially_locked_demands": 0,
+            "remaining_qty_total": 0.0,
+        }
+        return empty_details, empty_balance, overview, issues
+
+    details = pd.concat(frames, ignore_index=True)
+    details["_source_rank"] = details["source"].map({"fix": 0, "adjust": 1}).fillna(9).astype(int)
+    details = details.sort_values(["demand_id", "cross_source_key", "_source_rank", "seq", "source_row_id"]).reset_index(drop=True)
+    details["duplicate_flag"] = 0
+    details["issue_type"] = ""
+    details["active_lock_flag"] = 1
+
+    seen_strict: dict[str, int] = {}
+    for idx, row in details.iterrows():
+        key = str(row["dedup_key"])
+        if key in seen_strict:
+            details.loc[idx, "duplicate_flag"] = 1
+            details.loc[idx, "issue_type"] = "same_source_exact_duplicate"
+            details.loc[idx, "active_lock_flag"] = 0
+        else:
+            seen_strict[key] = idx
+
+    # cross-source duplicate heuristic (same demand/line/slot/qty) -> keep FIX first.
+    seen_cross: dict[str, int] = {}
+    for idx, row in details.iterrows():
+        if int(details.loc[idx, "active_lock_flag"]) == 0:
+            continue
+        key = str(row["cross_source_key"])
+        prev = seen_cross.get(key)
+        if prev is None:
+            seen_cross[key] = idx
+            continue
+        prev_qty = float(details.loc[prev, "lock_qty"])
+        cur_qty = float(row["lock_qty"])
+        if abs(prev_qty - cur_qty) <= 1e-9:
+            details.loc[idx, "duplicate_flag"] = 1
+            details.loc[idx, "issue_type"] = "cross_source_same_position_qty_duplicate"
+            details.loc[idx, "active_lock_flag"] = 0
+        else:
+            if not str(details.loc[prev, "issue_type"]):
+                details.loc[prev, "issue_type"] = "same_position_different_qty_needs_review"
+            details.loc[idx, "issue_type"] = "same_position_different_qty_needs_review"
+            issues.append(
+                {
+                    "level": "warning",
+                    "where": "locks",
+                    "message": (
+                        "Lock rows share demand/line/slot but have different lock_qty; both kept. "
+                        f"demand={row['demand_id']} line={row['line_id']} slot={row['slot_id']}"
+                    ),
+                }
+            )
+
+    active = details[details["active_lock_flag"].astype(int) == 1].copy()
+    by_demand = active.groupby("demand_id", as_index=False)["lock_qty"].sum().rename(columns={"lock_qty": "locked_qty_total"})
+    lock_balance = pd.DataFrame({"demand_id": list(demand_qty.keys()), "original_qty": list(demand_qty.values())})
+    lock_balance = lock_balance.merge(by_demand, on="demand_id", how="left")
+    lock_balance["locked_qty_total"] = pd.to_numeric(lock_balance["locked_qty_total"], errors="coerce").fillna(0.0)
+    lock_balance["remaining_qty"] = lock_balance["original_qty"] - lock_balance["locked_qty_total"]
+
+    over = int((lock_balance["locked_qty_total"] > lock_balance["original_qty"] + 1e-6).sum())
+    fully = int((lock_balance["remaining_qty"].abs() <= 1e-6).sum())
+    partial = int(((lock_balance["locked_qty_total"] > 1e-6) & (lock_balance["remaining_qty"] > 1e-6)).sum())
+    duplicated = int((details["duplicate_flag"].astype(int) > 0).sum())
+    overview = {
+        "fixed_locks": int(len(fixed_locks)),
+        "adjust_locks": int(len(adjust_locks)),
+        "duplicated_lock_rows": duplicated,
+        "over_locked_demands": over,
+        "fully_locked_demands": fully,
+        "partially_locked_demands": partial,
+        "remaining_qty_total": float(lock_balance["remaining_qty"].clip(lower=0).sum()),
+    }
+    if duplicated > 0:
+        issues.append(
+            {
+                "level": "warning",
+                "where": "locks",
+                "message": f"Detected and deactivated {duplicated} duplicate lock rows.",
+            }
+        )
+    return details.drop(columns=["_source_rank", "cross_source_key"], errors="ignore"), lock_balance, overview, issues
+
+
+def _assert_lock_balance_feasible(lock_balance: pd.DataFrame) -> None:
+    if lock_balance.empty:
+        return
+    over = lock_balance[lock_balance["locked_qty_total"] > lock_balance["original_qty"] + 1e-6]
+    if len(over):
+        sample = "; ".join(
+            f"demand={r.demand_id} original={r.original_qty} locked={r.locked_qty_total}"
+            for r in over.head(10).itertuples(index=False)
+        )
+        raise ValueError(f"Lock quantity exceeds demand quantity: {sample}")
+
+
+def _apply_remaining_qty(demands: pd.DataFrame, lock_balance: pd.DataFrame) -> pd.DataFrame:
+    if demands.empty or lock_balance.empty:
+        return demands.copy()
+    out = demands.copy()
+    out = out.merge(lock_balance[["demand_id", "locked_qty_total", "remaining_qty"]], on="demand_id", how="left")
+    out["remaining_qty"] = pd.to_numeric(out["remaining_qty"], errors="coerce").fillna(out["qty"])
+    out["qty"] = out["remaining_qty"].clip(lower=0.0)
+    out = out[out["qty"] > 1e-6].copy()
+    out["qty"] = out["qty"].round().astype(int)
+    return out.drop(columns=["locked_qty_total", "remaining_qty"], errors="ignore")
 
 
 def _line_cost(key: tuple[str, str, str], demands: pd.DataFrame, line_cell: dict[str, int], config: ModelConfig) -> float:

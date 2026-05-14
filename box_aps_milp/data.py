@@ -1103,23 +1103,33 @@ def _build_fixed_locks(
 ) -> pd.DataFrame:
     fix = sheets["aps_schedule_demand_fix_input"].copy()
     if fix.empty:
-        return pd.DataFrame(columns=["demand_id", "line_id", "slot_id", "seq", "lock_qty"])
+        return pd.DataFrame(columns=["lock_id", "source_row_id", "demand_id", "line_id", "slot_id", "shift_date", "shift", "seq", "lock_qty"])
     demand_qty = demands.set_index("demand_id")["qty"].to_dict()
     fix["demand_id"] = fix["demand_id"].map(_to_id)
     fix = fix[fix["demand_id"].isin(demand_qty)]
+    fix["source_row_id"] = ["fix_row_" + str(i + 1) for i in range(len(fix))]
+    if "id" in fix.columns:
+        fix["lock_id"] = fix["id"].map(_to_id)
+    elif "fix_id" in fix.columns:
+        fix["lock_id"] = fix["fix_id"].map(_to_id)
+    else:
+        fix["lock_id"] = ""
     fix["line_id"] = fix["fix_line_id"].map(_to_id)
+    fix["shift_date"] = pd.to_datetime(fix["fix_day"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    fix["shift"] = _safe_numeric(fix.get("fix_shift", 0)).astype(int).astype(str)
     fix["slot_id"] = [_slot_id(d, s) for d, s in zip(fix["fix_day"], fix["fix_shift"])]
     fix["seq"] = _safe_numeric(fix.get("fix_seq", 0)).astype(int)
-    fix["fix_qty"] = _safe_numeric(fix.get("fix_qty", 0)).astype(int)
-    fix["lock_qty"] = fix["demand_id"].map(demand_qty).astype(int)
-    mismatch = fix[fix["fix_qty"] != fix["lock_qty"]]
+    fix["fix_qty"] = _safe_numeric(fix.get("fix_qty", 0)).astype(float)
+    fix["lock_qty"] = fix["fix_qty"].astype(float)
+    mismatch = fix[(fix["fix_qty"] > 0) & (fix["fix_qty"] != fix["demand_id"].map(demand_qty).astype(float))]
     if len(mismatch):
-        issues.append({"level": "warning", "where": "fix", "message": f"{len(mismatch)} FIX rows have fix_qty different from demand qty; v6 locks whole demand qty."})
-    dup = fix["demand_id"].duplicated().sum()
-    if dup:
-        issues.append({"level": "warning", "where": "fix", "message": f"{int(dup)} duplicated FIX demand rows; using the first row per demand."})
-    return fix.sort_values(["demand_id", "seq"]).drop_duplicates("demand_id")[
-        ["demand_id", "line_id", "slot_id", "seq", "lock_qty"]
+        issues.append({"level": "info", "where": "fix", "message": f"{len(mismatch)} FIX rows have fix_qty different from demand qty; lock uses fix_qty as quantity lock."})
+    non_positive = int((fix["lock_qty"] <= 0).sum())
+    if non_positive:
+        issues.append({"level": "warning", "where": "fix", "message": f"{non_positive} FIX rows have non-positive fix_qty and were dropped."})
+    fix = fix[fix["lock_qty"] > 0].copy()
+    return fix.sort_values(["demand_id", "seq", "source_row_id"])[
+        ["lock_id", "source_row_id", "demand_id", "line_id", "slot_id", "shift_date", "shift", "seq", "lock_qty"]
     ].reset_index(drop=True)
 
 
@@ -1131,26 +1141,36 @@ def _split_adjust_schedule(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     adj = sheets["aps_adjust_schedule_input"].copy()
     if adj.empty:
-        empty_lock = pd.DataFrame(columns=["demand_id", "line_id", "slot_id", "seq", "lock_qty"])
+        empty_lock = pd.DataFrame(columns=["lock_id", "source_row_id", "demand_id", "line_id", "slot_id", "shift_date", "shift", "seq", "lock_qty"])
         return empty_lock, adj
     demand_qty = demands.set_index("demand_id")["qty"].to_dict()
     adj["demand_id"] = adj["demand_id"].map(_to_id)
+    adj["source_row_id"] = ["adjust_row_" + str(i + 1) for i in range(len(adj))]
+    if "id" in adj.columns:
+        adj["lock_id"] = adj["id"].map(_to_id)
+    elif "adjust_id" in adj.columns:
+        adj["lock_id"] = adj["adjust_id"].map(_to_id)
+    else:
+        adj["lock_id"] = ""
     adj["line_id"] = adj["line_id"].map(_to_id)
+    adj["shift_date"] = pd.to_datetime(adj["schedule_day"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+    adj["shift"] = _safe_numeric(adj.get("shift_seq", 0)).astype(int).astype(str)
     adj["slot_id"] = [_slot_id(d, s) for d, s in zip(adj["schedule_day"], adj["shift_seq"])]
     adj["seq"] = _safe_numeric(adj.get("schedule_seq", 0)).astype(int)
-    adj["schedule_qty"] = _safe_numeric(adj.get("schedule_qty", 0)).astype(int)
+    adj["schedule_qty"] = _safe_numeric(adj.get("schedule_qty", 0)).astype(float)
 
     inside = adj[adj["demand_id"].isin(demand_qty)].copy()
     outside = adj[~adj["demand_id"].isin(demand_qty)].copy()
-    inside["lock_qty"] = inside["demand_id"].map(demand_qty).astype(int)
-    mismatch = inside[inside["schedule_qty"] != inside["lock_qty"]]
+    inside["lock_qty"] = inside["schedule_qty"].astype(float)
+    mismatch = inside[(inside["schedule_qty"] > 0) & (inside["schedule_qty"] != inside["demand_id"].map(demand_qty).astype(float))]
     if len(mismatch):
-        issues.append({"level": "warning", "where": "adjust", "message": f"{len(mismatch)} inherited rows have schedule_qty different from demand qty; v6 locks whole demand qty."})
-    dup = inside["demand_id"].duplicated().sum()
-    if dup:
-        issues.append({"level": "warning", "where": "adjust", "message": f"{int(dup)} duplicated inherited demand rows; using first row per demand."})
-    lock = inside.sort_values(["demand_id", "seq"]).drop_duplicates("demand_id")[
-        ["demand_id", "line_id", "slot_id", "seq", "lock_qty"]
+        issues.append({"level": "info", "where": "adjust", "message": f"{len(mismatch)} inherited rows have schedule_qty different from demand qty; lock uses schedule_qty as quantity lock."})
+    non_positive = int((inside["lock_qty"] <= 0).sum())
+    if non_positive:
+        issues.append({"level": "warning", "where": "adjust", "message": f"{non_positive} inherited rows have non-positive schedule_qty and were dropped."})
+    inside = inside[inside["lock_qty"] > 0].copy()
+    lock = inside.sort_values(["demand_id", "seq", "source_row_id"])[
+        ["lock_id", "source_row_id", "demand_id", "line_id", "slot_id", "shift_date", "shift", "seq", "lock_qty"]
     ].reset_index(drop=True)
     return lock, outside.reset_index(drop=True)
 
