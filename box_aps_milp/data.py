@@ -41,7 +41,6 @@ REQUIRED_SHEETS = [
     "aps_schedule_order_ruler",
     "aps_schedule_order_qty",
     "aps_schedule_priority",
-    "aps_merge_priority_setting",
     "aps_adjust_schedule_input",
 ]
 
@@ -51,6 +50,8 @@ REQUIRED_SHEETS = [
 OPTIONAL_SHEETS = [
     "aps_schedule_reserver_input",
     "aps_schedule_demand_reserve_input",
+    "aps_merge_priority_setting",
+    "aps_schedule_merge_priority_setting",
 ]
 
 
@@ -200,7 +201,7 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
 
     raw_demands = _build_demands(sheets, slots, config, issues)
     merge_excluded = _merge_excluded_demand_ids(sheets, raw_demands)
-    demands, merge_map = _apply_merge_priority(sheets, raw_demands, merge_excluded, issues)
+    demands, merge_map, merge_trace = _apply_merge_priority(sheets, raw_demands, merge_excluded, issues)
     logger.info(
         "preprocess:demands raw=%s merged=%s merge_map=%s excluded=%s",
         len(raw_demands),
@@ -299,8 +300,8 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         "priority_settings": {
             "schedule_priority_sheet": "aps_schedule_priority",
             "schedule_priority_active": bool(not sheets.get("aps_schedule_priority", pd.DataFrame()).empty),
-            "merge_priority_sheet": "aps_merge_priority_setting",
-            "merge_priority_loaded": bool(not sheets.get("aps_merge_priority_setting", pd.DataFrame()).empty),
+            "merge_priority_sheet": str(merge_trace.get("merge_source_table", "none")),
+            "merge_priority_loaded": bool(str(merge_trace.get("merge_source_table", "none")) != "none"),
             "merge_priority_applied": bool(merge_applied_raw > 0),
         },
         "counts": {
@@ -765,18 +766,40 @@ def _apply_merge_priority(
     raw_demands: pd.DataFrame,
     excluded_ids: set[str],
     issues: list[dict[str, Any]],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     if raw_demands.empty:
-        return raw_demands.copy(), pd.DataFrame(columns=["raw_demand_id", "merged_demand_id", "merge_applied", "member_rank", "raw_qty"])
+        empty_map = pd.DataFrame(
+            columns=[
+                "raw_demand_id",
+                "merged_demand_id",
+                "merge_applied",
+                "member_rank",
+                "raw_qty",
+                "merge_source_table",
+                "merge_key_snapshot",
+            ]
+        )
+        return raw_demands.copy(), empty_map, {"merge_source_table": "none"}
 
     demands = raw_demands.copy()
     demands["demand_id"] = demands["demand_id"].astype(str)
     demands["_merged_demand_id"] = demands["demand_id"]
+    demands["_merge_key_snapshot"] = ""
 
-    rules = sheets.get("aps_merge_priority_setting", pd.DataFrame()).copy()
+    source_table = "none"
+    rules = pd.DataFrame()
+    new_rules = sheets.get("aps_schedule_merge_priority_setting", pd.DataFrame())
+    old_rules = sheets.get("aps_merge_priority_setting", pd.DataFrame())
+    if isinstance(new_rules, pd.DataFrame) and not new_rules.empty:
+        rules = new_rules.copy()
+        source_table = "aps_schedule_merge_priority_setting"
+    elif isinstance(old_rules, pd.DataFrame) and not old_rules.empty:
+        rules = old_rules.copy()
+        source_table = "aps_merge_priority_setting"
+
     if rules.empty:
-        merge_map = _build_merge_map(demands)
-        return demands.drop(columns=["_merged_demand_id"], errors="ignore"), merge_map
+        merge_map = _build_merge_map(demands, merge_source_table=source_table, merge_key_snapshot_col="_merge_key_snapshot")
+        return demands.drop(columns=["_merged_demand_id", "_merge_key_snapshot"], errors="ignore"), merge_map, {"merge_source_table": source_table}
 
     for col in ["mcode", "plant", "priority_desc"]:
         if col not in rules.columns:
@@ -813,10 +836,17 @@ def _apply_merge_priority(
                 continue
             merged_id = _make_merged_demand_id(candidates.loc[indices, "demand_id"].astype(str).tolist(), str(mcode).strip())
             demands.loc[indices, "_merged_demand_id"] = merged_id
+            demands.loc[indices, "_merge_key_snapshot"] = "|".join(
+                f"{field}={value}" for field, value in zip(key_fields, key)
+            )
 
-    merge_map = _build_merge_map(demands)
-    merged_demands = _aggregate_merged_demands(demands, merge_map)
-    return merged_demands, merge_map
+    merge_map = _build_merge_map(
+        demands,
+        merge_source_table=source_table,
+        merge_key_snapshot_col="_merge_key_snapshot",
+    )
+    merged_demands = _aggregate_merged_demands(demands, merge_map, issues)
+    return merged_demands, merge_map, {"merge_source_table": source_table}
 
 
 def _merge_stage_fields(rules: pd.DataFrame, issues: list[dict[str, Any]]) -> list[str]:
@@ -860,11 +890,20 @@ def _make_merged_demand_id(raw_ids: list[str], mcode: str) -> str:
     return f"MRG::{prefix}::{digest}"
 
 
-def _build_merge_map(demands_with_assignment: pd.DataFrame) -> pd.DataFrame:
+def _build_merge_map(
+    demands_with_assignment: pd.DataFrame,
+    merge_source_table: str = "none",
+    merge_key_snapshot_col: str = "_merge_key_snapshot",
+) -> pd.DataFrame:
     base = demands_with_assignment.copy()
     base["raw_demand_id"] = base["demand_id"].astype(str)
     base["merged_demand_id"] = base["_merged_demand_id"].astype(str)
     base["raw_qty"] = _safe_numeric(base.get("qty", 0)).astype(int)
+    if merge_key_snapshot_col in base.columns:
+        base["merge_key_snapshot"] = base[merge_key_snapshot_col].fillna("").astype(str)
+    else:
+        base["merge_key_snapshot"] = ""
+    base["merge_source_table"] = str(merge_source_table or "none")
     base["_member_rank"] = (
         pd.to_numeric(base.get("total_index", pd.NA), errors="coerce")
         .fillna(10**9)
@@ -874,10 +913,20 @@ def _build_merge_map(demands_with_assignment: pd.DataFrame) -> pd.DataFrame:
     base["member_rank"] = base.groupby("merged_demand_id").cumcount() + 1
     group_size = base.groupby("merged_demand_id")["raw_demand_id"].transform("size")
     base["merge_applied"] = (group_size > 1).astype(int)
-    return base[["raw_demand_id", "merged_demand_id", "merge_applied", "member_rank", "raw_qty"]]
+    return base[
+        [
+            "raw_demand_id",
+            "merged_demand_id",
+            "merge_applied",
+            "member_rank",
+            "raw_qty",
+            "merge_source_table",
+            "merge_key_snapshot",
+        ]
+    ]
 
 
-def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame) -> pd.DataFrame:
+def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame, issues: list[dict[str, Any]]) -> pd.DataFrame:
     left = raw_demands.copy()
     left = left.drop(columns=["_merged_demand_id"], errors="ignore")
     joined = left.merge(
@@ -888,8 +937,10 @@ def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame
     joined["_merged_demand_id"] = joined["_merged_demand_id"].fillna(joined["demand_id"].astype(str))
     rows: list[dict[str, Any]] = []
     for merged_id, group in joined.groupby("_merged_demand_id", sort=False):
+        group = group.sort_values(["member_rank", "demand_id"], na_position="last").reset_index(drop=True)
         first = group.iloc[0]
         row: dict[str, Any] = {"demand_id": str(merged_id)}
+        mixed_fields: list[str] = []
         for col in group.columns:
             if col.startswith("_") or col in {"demand_id", "merge_applied", "member_rank", "raw_qty"}:
                 continue
@@ -903,14 +954,36 @@ def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame
                 row[col] = _strict_date_pick(group[col], prefer="latest")
             elif col in {"ots_date", "fpsd", "ship_day_two"}:
                 row[col] = _strict_date_pick(group[col], prefer="earliest")
+            elif col == "mr_day_dt":
+                row[col] = _strict_datetime_pick(group[col], prefer="latest")
+            elif col in {"ots_date_dt", "fpsd_dt", "ship_day_two_dt"}:
+                row[col] = _strict_datetime_pick(group[col], prefer="earliest")
             elif col == "om_urgent":
                 row[col] = _truthy_text_pick(group[col])
+            elif col == "urgent":
+                row[col] = int(pd.to_numeric(group[col], errors="coerce").fillna(0).max())
             elif col == "mo":
                 row[col] = _stable_single_or_blank(group[col])
+            elif col in {"priority_rank"}:
+                row[col] = int(pd.to_numeric(group[col], errors="coerce").fillna(10**9).min())
+            elif col in {"priority_weight"}:
+                row[col] = float(pd.to_numeric(group[col], errors="coerce").fillna(0).max())
             else:
-                row[col] = first.get(col, pd.NA)
+                consensus, is_mixed = _consensus_or_mixed(group[col])
+                row[col] = consensus
+                if is_mixed:
+                    mixed_fields.append(col)
         row["raw_demand_count"] = int(len(group))
         row["member_demand_ids"] = "|".join(group["demand_id"].astype(str).tolist())
+        row["merge_mixed_fields"] = "|".join(sorted(set(mixed_fields)))
+        if mixed_fields:
+            issues.append(
+                {
+                    "level": "info",
+                    "where": "merge_aggregate",
+                    "message": f"Merged demand {merged_id} has mixed values in fields: {sorted(set(mixed_fields))}",
+                }
+            )
         rows.append(row)
     out = pd.DataFrame(rows)
     for col in ["pre_lock", "fast_ship", "cust_svc", "ord_qty", "line_qty", "raw_demand_count"]:
@@ -930,6 +1003,13 @@ def _strict_date_pick(values: pd.Series, prefer: str) -> Any:
     return pd.Timestamp(target).strftime("%Y-%m-%d")
 
 
+def _strict_datetime_pick(values: pd.Series, prefer: str) -> Any:
+    parsed = pd.to_datetime(values, errors="coerce").dropna()
+    if parsed.empty:
+        return pd.NaT
+    return parsed.max() if prefer == "latest" else parsed.min()
+
+
 def _truthy_text_pick(values: pd.Series) -> Any:
     non_empty = [str(v).strip() for v in values.fillna("").astype(str) if str(v).strip()]
     if not non_empty:
@@ -945,6 +1025,18 @@ def _stable_single_or_blank(values: pd.Series) -> Any:
     if len(distinct) == 1:
         return distinct[0]
     return pd.NA
+
+
+def _consensus_or_mixed(values: pd.Series) -> tuple[Any, bool]:
+    cleaned = values.fillna("").astype(str).str.strip()
+    non_empty = [v for v in cleaned.tolist() if v != ""]
+    if not non_empty:
+        return pd.NA, False
+    distinct = sorted(set(non_empty))
+    if len(distinct) == 1:
+        return distinct[0], False
+    # keep deterministic representative while surfacing mixed state
+    return non_empty[0], True
 
 
 def _propagate_priority_to_raw_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame, demands: pd.DataFrame) -> pd.DataFrame:
@@ -1578,7 +1670,10 @@ def _prune_sparse_triples(
     if config.due_buffer_days is not None:
         base_candidates = out.copy()
         due_cols = ["ots_date_dt", "fpsd_dt", "ship_day_two_dt"]
+        for col in due_cols:
+            out[col] = pd.to_datetime(out[col], errors="coerce")
         due_min = out[due_cols].min(axis=1)
+        due_min = pd.to_datetime(due_min, errors="coerce")
         due_limit = due_min + pd.to_timedelta(int(config.due_buffer_days), unit="D")
         keep_due = due_limit.isna() | out["shift_start_time"].isna() | (out["shift_start_time"] <= due_limit)
         out = out[keep_due].copy()
