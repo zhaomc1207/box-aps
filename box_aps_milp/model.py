@@ -708,8 +708,16 @@ def _build_due_sets(
     The business rule (BOX-智能排产约束规则.xlsx, rule 13.1/13.2/13.4) requires
     `due_date - schedule_date >= buffer_days`. We therefore consider a candidate
     slot on-time only when its shift completes at least ``buffer_days`` calendar
-    days before the due date. The slot end is compared against the START of
-    ``due_date - buffer_days``.
+    days before the due date.
+
+    v7.6 alignment: timely cutoff must be EndOfDay(due_date - buffer_days),
+    not StartOfDay. This keeps the MILP KPI set consistent with the preprocessing
+    timely-window semantics and avoids a 24-hour over-strict discrepancy.
+
+    Boundary example:
+    - due=2026-05-20, buffer=2 -> cutoff=2026-05-18 23:59:59
+    - slot_end=2026-05-18 20:00:00 => on-time (included)
+    - slot_end=2026-05-19 00:00:00 => not on-time (excluded)
     """
     slots = data.slots.copy()
     slots["shift_end_time"] = pd.to_datetime(slots["shift_end_time"], errors="coerce")
@@ -725,7 +733,12 @@ def _build_due_sets(
                 result[name][d.demand_id] = set(slot_end)
                 continue
             buffer_days = buffers[name]
-            cutoff = pd.Timestamp(due).normalize() - pd.Timedelta(days=int(buffer_days))
+            # v7.6: timely definition uses EndOfDay(due - buffer_days).
+            cutoff = (
+                pd.Timestamp(due).normalize()
+                - pd.Timedelta(days=int(buffer_days))
+                + pd.Timedelta(hours=23, minutes=59, seconds=59)
+            )
             result[name][d.demand_id] = {
                 slot for slot, end in slot_end.items() if pd.notna(end) and end <= cutoff
             }
