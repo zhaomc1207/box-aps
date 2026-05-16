@@ -94,6 +94,9 @@ class PreprocessConfig:
     default_kpi_mode: str = "qtymax"
     # v7_1: relax candidate pruning to trade more solver time for tighter solutions.
     due_buffer_days: int | None = 3
+    ots_ext_days: int = 3
+    fpsd_ext_days: int = 3
+    ship2_ext_days: int = 3
     max_lines_per_demand_day: int | None = 5
     max_slots_per_demand: int | None = 60
     bucket_after_days: int | None = 5
@@ -174,7 +177,22 @@ def load_processed_data(input_dir: str | Path) -> ProcessedData:
     for col in ["day", "shift_start_time", "shift_end_time"]:
         if col in tables["line_slots"].columns:
             tables["line_slots"][col] = pd.to_datetime(tables["line_slots"][col], errors="coerce")
-    tables["triples"] = _restore_numeric(tables["triples"], ["uph", "elig", "slot_rank"])
+    tables["triples"] = _restore_numeric(
+        tables["triples"],
+        [
+            "uph",
+            "elig",
+            "slot_rank",
+            "is_ots_timely",
+            "is_fpsd_timely",
+            "is_ship2_timely",
+            "is_ots_extended",
+            "is_fpsd_extended",
+            "is_ship2_extended",
+            "keep_by_timely",
+            "keep_by_extended",
+        ],
+    )
     tables["fai_arcs"] = _restore_numeric(tables["fai_arcs"], ["lead_hours"])
     tables["change_min"] = _restore_numeric(tables["change_min"], ["ct_min_hours"])
     return ProcessedData(config=config, metadata=meta["metadata"], **tables)
@@ -312,6 +330,13 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
             "cycle_merge_hit_rules": int(merge_trace.get("cycle_merge_hit_rules", 0)),
             "merge_execution_order": str(merge_trace.get("merge_execution_order", "priority_then_cycle")),
         },
+        "kpi_settings": {
+            "ots_ext_days": int(config.ots_ext_days),
+            "fpsd_ext_days": int(config.fpsd_ext_days),
+            "ship2_ext_days": int(config.ship2_ext_days),
+            "due_buffer_days_legacy": None if config.due_buffer_days is None else int(config.due_buffer_days),
+            "kpi_cutoff_policy": "end_of_day",
+        },
         "counts": {
             "raw_demands": int(len(raw_demands)),
             "demands": int(len(demands)),
@@ -434,10 +459,32 @@ def _to_id(value: Any) -> str:
     return str(value).strip()
 
 
+def _fast_to_datetime_cleaned(series: pd.Series) -> pd.Series:
+    """Fast datetime parse for large string columns.
+
+    Keeps existing semantics:
+    - empty string -> NaT
+    - invalid text -> NaT
+    - still supports mixed formats via fallback
+    """
+    cleaned = series.fillna("").astype(str).str.strip()
+    masked = cleaned.where(cleaned.ne(""))
+
+    # Fast path: common BOX date format (YYYY-MM-DD)
+    parsed = pd.to_datetime(masked, format="%Y-%m-%d", errors="coerce")
+
+    # Fallback path: only parse rows not handled by fast path
+    need_fallback = masked.notna() & parsed.isna()
+    if need_fallback.any():
+        parsed.loc[need_fallback] = pd.to_datetime(masked.loc[need_fallback], errors="coerce")
+
+    return parsed
+
+
 def _safe_datetime(series: pd.Series) -> pd.Series:
     text = series.astype("string").str.strip()
     text = text.mask(text.str.startswith("9999", na=False))
-    return pd.to_datetime(text, errors="coerce")
+    return _fast_to_datetime_cleaned(text)
 
 
 def _safe_numeric(series: pd.Series, default: float = 0.0) -> pd.Series:
@@ -1176,8 +1223,7 @@ def _aggregate_merged_demands(raw_demands: pd.DataFrame, merge_map: pd.DataFrame
 
 def _strict_date_pick(values: pd.Series, prefer: str) -> Any:
     cleaned = values.fillna("").astype(str).str.strip()
-    parsed = pd.to_datetime(cleaned.where(cleaned.ne("")), errors="coerce")
-    parsed = parsed.dropna()
+    parsed = _fast_to_datetime_cleaned(cleaned).dropna()
     if parsed.empty:
         return pd.NA
     target = parsed.max() if prefer == "latest" else parsed.min()
@@ -1847,19 +1893,62 @@ def _prune_sparse_triples(
         on="demand_id",
         how="left",
     )
+    for col in ["mr_day_dt", "ots_date_dt", "fpsd_dt", "ship_day_two_dt"]:
+        out[col] = pd.to_datetime(out[col], errors="coerce")
+    base_candidates = out.copy()
 
-    if config.due_buffer_days is not None:
-        base_candidates = out.copy()
-        due_cols = ["ots_date_dt", "fpsd_dt", "ship_day_two_dt"]
-        for col in due_cols:
-            out[col] = pd.to_datetime(out[col], errors="coerce")
-        due_min = out[due_cols].min(axis=1)
-        due_min = pd.to_datetime(due_min, errors="coerce")
-        due_limit = due_min + pd.to_timedelta(int(config.due_buffer_days), unit="D")
-        keep_due = due_limit.isna() | out["shift_start_time"].isna() | (out["shift_start_time"] <= due_limit)
-        out = out[keep_due].copy()
-    else:
-        base_candidates = out.copy()
+    due_buffer = int(config.due_buffer_days or 0)
+    eod = pd.Timedelta(hours=23, minutes=59, seconds=59)
+    # Vectorized KPI cutoffs: EndOfDay(due +/- days)
+    out["_ots_timely_cutoff"] = out["ots_date_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
+    out["_fpsd_timely_cutoff"] = out["fpsd_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
+    out["_ship2_timely_cutoff"] = out["ship_day_two_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
+    out["_ots_ext_cutoff"] = out["ots_date_dt"].dt.normalize() + pd.to_timedelta(int(config.ots_ext_days), unit="D") + eod
+    out["_fpsd_ext_cutoff"] = out["fpsd_dt"].dt.normalize() + pd.to_timedelta(int(config.fpsd_ext_days), unit="D") + eod
+    out["_ship2_ext_cutoff"] = out["ship_day_two_dt"].dt.normalize() + pd.to_timedelta(int(config.ship2_ext_days), unit="D") + eod
+
+    out["is_ots_timely"] = (
+        out["ots_date_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_ots_timely_cutoff"])
+    ).astype(int)
+    out["is_fpsd_timely"] = (
+        out["fpsd_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_fpsd_timely_cutoff"])
+    ).astype(int)
+    out["is_ship2_timely"] = (
+        out["ship_day_two_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_ship2_timely_cutoff"])
+    ).astype(int)
+    out["is_ots_extended"] = (
+        out["ots_date_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_ots_ext_cutoff"])
+    ).astype(int)
+    out["is_fpsd_extended"] = (
+        out["fpsd_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_fpsd_ext_cutoff"])
+    ).astype(int)
+    out["is_ship2_extended"] = (
+        out["ship_day_two_dt"].isna()
+        | out["shift_start_time"].isna()
+        | (out["shift_start_time"] <= out["_ship2_ext_cutoff"])
+    ).astype(int)
+    out["keep_by_timely"] = (
+        (out["is_ots_timely"] > 0) | (out["is_fpsd_timely"] > 0) | (out["is_ship2_timely"] > 0)
+    ).astype(int)
+    out["keep_by_extended"] = (
+        (out["is_ots_extended"] > 0) | (out["is_fpsd_extended"] > 0) | (out["is_ship2_extended"] > 0)
+    ).astype(int)
+    keep_kpi = (out["keep_by_timely"] > 0) | (out["keep_by_extended"] > 0)
+    out = out[keep_kpi].copy()
+    # Vectorized reason tagging (avoid slow axis=1 apply on multi-million rows).
+    out["kept_by_reason"] = "fallback"
+    out.loc[out["keep_by_extended"] > 0, "kept_by_reason"] = "extended"
+    out.loc[out["keep_by_timely"] > 0, "kept_by_reason"] = "timely"
 
     if config.max_lines_per_demand_day is not None and config.max_lines_per_demand_day > 0 and len(out):
         out["_day"] = out["shift_start_time"].dt.normalize()
@@ -1897,6 +1986,20 @@ def _prune_sparse_triples(
         fallback = fallback.sort_values(["demand_id", "slot_rank", "uph"], ascending=[True, True, False])
         fallback["_slot_keep_rank"] = fallback.groupby("demand_id").cumcount() + 1
         fallback = fallback[fallback["_slot_keep_rank"] <= fallback_limit]
+        # fallback rows are retained for anti-empty safety and must keep trace flags.
+        for col in [
+            "is_ots_timely",
+            "is_fpsd_timely",
+            "is_ship2_timely",
+            "is_ots_extended",
+            "is_fpsd_extended",
+            "is_ship2_extended",
+            "keep_by_timely",
+            "keep_by_extended",
+        ]:
+            if col not in fallback.columns:
+                fallback[col] = 0
+        fallback["kept_by_reason"] = "fallback"
         out = pd.concat([out, fallback], ignore_index=True)
 
     drop_cols = [
@@ -1908,6 +2011,12 @@ def _prune_sparse_triples(
         "_due_min",
         "_on_time",
         "_slot_keep_rank",
+        "_ots_timely_cutoff",
+        "_fpsd_timely_cutoff",
+        "_ship2_timely_cutoff",
+        "_ots_ext_cutoff",
+        "_fpsd_ext_cutoff",
+        "_ship2_ext_cutoff",
     ]
     out = out.drop(columns=drop_cols, errors="ignore")
     out = out.drop_duplicates(["demand_id", "line_id", "slot_id"]).reset_index(drop=True)
@@ -2002,10 +2111,31 @@ def _apply_day_buckets(
             bucket_col = f"{col}_bucket"
             if bucket_col in new_triples.columns:
                 new_triples[col] = new_triples[bucket_col].combine_first(new_triples[col])
+        grouped = new_triples.groupby(["demand_id", "line_id", "slot_id"], as_index=False)
+        out_rows: list[dict[str, Any]] = []
+        for _, grp in grouped:
+            best = grp.sort_values(["uph"], ascending=[False]).iloc[0].to_dict()
+            for col in [
+                "is_ots_timely",
+                "is_fpsd_timely",
+                "is_ship2_timely",
+                "is_ots_extended",
+                "is_fpsd_extended",
+                "is_ship2_extended",
+                "keep_by_timely",
+                "keep_by_extended",
+            ]:
+                if col in grp.columns:
+                    best[col] = int(pd.to_numeric(grp[col], errors="coerce").fillna(0).max())
+            if "kept_by_reason" in grp.columns:
+                reasons = [str(v).strip() for v in grp["kept_by_reason"].fillna("").astype(str).tolist() if str(v).strip()]
+                best["kept_by_reason"] = "|".join(sorted(set(reasons))) if reasons else ""
+            out_rows.append(best)
+        new_triples = pd.DataFrame(out_rows)
         new_triples = (
-            new_triples.sort_values(["demand_id", "line_id", "slot_id", "uph"], ascending=[True, True, True, False])
+            new_triples.drop(columns=[c for c in new_triples.columns if c.endswith("_bucket")], errors="ignore")
+            .sort_values(["demand_id", "line_id", "slot_id"])
             .drop_duplicates(["demand_id", "line_id", "slot_id"])
-            .drop(columns=[c for c in new_triples.columns if c.endswith("_bucket")], errors="ignore")
             .reset_index(drop=True)
         )
 
@@ -2026,6 +2156,22 @@ def _bucket_locks(locks: pd.DataFrame, slot_map: dict[str, str]) -> pd.DataFrame
     out = locks.copy()
     out["slot_id"] = out["slot_id"].map(lambda s: slot_map.get(s, s))
     return out
+
+
+def _end_of_day_with_days(value: Any, day_delta: int) -> pd.Timestamp:
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return pd.NaT
+    day = pd.Timestamp(ts).normalize() + pd.Timedelta(days=int(day_delta))
+    return day + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+
+def _kpi_kept_reason(row: pd.Series) -> str:
+    if int(row.get("keep_by_timely", 0) or 0) > 0:
+        return "timely"
+    if int(row.get("keep_by_extended", 0) or 0) > 0:
+        return "extended"
+    return "fallback"
 
 
 def _build_priority(

@@ -290,6 +290,9 @@ def _add_preprocess_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--calendar-require-demand-flag", action="store_true")
     parser.add_argument("--due-buffer-days", type=int, default=3, help="Keep demand candidates through earliest due date plus this many days (v7_1 default: 3).")
+    parser.add_argument("--ots-ext-days", type=int, default=3, help="OTS extension window days for KPI candidate retention (v7.5).")
+    parser.add_argument("--fpsd-ext-days", type=int, default=3, help="FPSD extension window days for KPI candidate retention (v7.5).")
+    parser.add_argument("--ship2-ext-days", type=int, default=3, help="ship_day_two extension window days for KPI candidate retention (v7.5).")
     parser.add_argument("--max-lines-per-demand-day", type=int, default=5, help="Keep at most this many candidate lines per demand per day (v7_1 default: 5).")
     parser.add_argument("--max-slots-per-demand", type=int, default=60, help="Keep at most this many candidate line-slot columns per demand (v7_1 default: 60).")
     parser.add_argument("--bucket-after-days", type=int, default=5, help="Collapse shifts after this many days into line-day buckets (v7_1 default: 5).")
@@ -305,6 +308,9 @@ def _preprocess_config_from_args(args: argparse.Namespace) -> PreprocessConfig:
         calendar_require_demand_flag=args.calendar_require_demand_flag,
         fai_lead_time_unit=args.fai_lead_time_unit,
         due_buffer_days=args.due_buffer_days,
+        ots_ext_days=args.ots_ext_days,
+        fpsd_ext_days=args.fpsd_ext_days,
+        ship2_ext_days=args.ship2_ext_days,
         max_lines_per_demand_day=args.max_lines_per_demand_day,
         max_slots_per_demand=args.max_slots_per_demand,
         bucket_after_days=args.bucket_after_days,
