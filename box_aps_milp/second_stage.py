@@ -29,9 +29,11 @@ def run_second_stage(solution: pd.DataFrame, data: ProcessedData) -> SecondStage
         return SecondStageResult(solution=solution.copy(), report={"issues": [], "counts": {}})
 
     sequenced = _sequence_line_slots(solution, data)
+    sequenced = _assign_timeline_with_fai_wait(sequenced, data)
     issues: list[dict[str, Any]] = []
     counts: dict[str, Any] = {}
 
+    fai_sort_conflict_count = _check_fai_lock_seq_conflicts(sequenced, data, issues)
     split_count = _check_same_demand_same_slot_split(sequenced, issues)
     fai_count = _check_fai_precedence(sequenced, data, issues)
     capacity_count = _check_capacity(sequenced, data, issues)
@@ -40,8 +42,15 @@ def run_second_stage(solution: pd.DataFrame, data: ProcessedData) -> SecondStage
     counts.update(
         {
             "same_demand_same_slot_split_count": split_count,
+            "fai_sort_conflict_count": fai_sort_conflict_count,
             "fai_violation_count": fai_count,
             "capacity_violation_slot_count": capacity_count,
+            "time_overrun_row_count": int(
+                pd.to_numeric(sequenced.get("time_overrun_flag", 0), errors="coerce").fillna(0).astype(int).sum()
+            ),
+            "fai_wait_minutes_total": float(
+                pd.to_numeric(sequenced.get("fai_wait_minutes", 0.0), errors="coerce").fillna(0.0).sum()
+            ),
             **changeover_counts,
         }
     )
@@ -58,6 +67,7 @@ def _sequence_line_slots(solution: pd.DataFrame, data: ProcessedData) -> pd.Data
     out["_shift_start"] = pd.to_datetime(out.get("shift_start_time"), errors="coerce")
 
     sort_cols = _sort_columns_from_demands(data)
+    fai_rank_map, fai_role_map = _build_fai_sort_maps(data)
     demand_extra_cols = ["kb", "log_up_assy", "cover_assy", "pcba", "program", "color"]
     demand_extra_cols = [c for c in demand_extra_cols if c in data.demands.columns and c not in out.columns]
     if demand_extra_cols:
@@ -84,6 +94,8 @@ def _sequence_line_slots(solution: pd.DataFrame, data: ProcessedData) -> pd.Data
     out["_source_rank"] = out.get("source", "").map(source_rank).fillna(9).astype(int)
     out["_locked_first"] = out["seq"].notna().astype(int)
     out["_seq_sort"] = pd.to_numeric(out["seq"], errors="coerce").fillna(10**9)
+    out["_fai_rank"] = out["demand_id"].map(lambda d: int(fai_rank_map.get(str(d), 1))).astype(int)
+    out["_fai_role"] = out["demand_id"].map(lambda d: str(fai_role_map.get(str(d), "")))
 
     for col in ["lot", "mo", "model", *sort_cols, "demand_id"]:
         if col not in out.columns:
@@ -101,6 +113,7 @@ def _sequence_line_slots(solution: pd.DataFrame, data: ProcessedData) -> pd.Data
         "_locked_first",
         "_source_rank",
         "_seq_sort",
+        "_fai_rank",
         "model",
         "lot",
         "mo",
@@ -117,9 +130,155 @@ def _sequence_line_slots(solution: pd.DataFrame, data: ProcessedData) -> pd.Data
         "_source_rank",
         "_locked_first",
         "_seq_sort",
+        "_fai_rank",
+        "_fai_role",
         "_lock_source",
     ]
     return out.drop(columns=drop_cols, errors="ignore")
+
+
+def _build_fai_sort_maps(data: ProcessedData) -> tuple[dict[str, int], dict[str, str]]:
+    """Build demand-level FAI sorting rank (first=0, rest=2, other=1)."""
+    rank: dict[str, int] = {}
+    role: dict[str, str] = {}
+    if data.fai_arcs.empty:
+        return rank, role
+    for arc in data.fai_arcs.itertuples(index=False):
+        first_d = str(arc.first_demand_id)
+        rest_d = str(arc.rest_demand_id)
+        rank[first_d] = min(rank.get(first_d, 1), 0)
+        role[first_d] = "first"
+        rank[rest_d] = max(rank.get(rest_d, 1), 2)
+        role[rest_d] = role.get(rest_d, "rest")
+    return rank, role
+
+
+def _check_fai_lock_seq_conflicts(solution: pd.DataFrame, data: ProcessedData, issues: list[dict[str, Any]]) -> int:
+    """Report conflicts where lock seq implies rest-before-first inside same slot."""
+    if data.fai_arcs.empty or solution.empty:
+        return 0
+    sol = solution.copy()
+    sol["demand_id"] = sol["demand_id"].astype(str)
+    sol["line_id"] = sol["line_id"].astype(str)
+    sol["slot_id"] = sol["slot_id"].astype(str)
+    sol["sequence"] = pd.to_numeric(sol.get("sequence", 0), errors="coerce").fillna(0).astype(int)
+    pos = sol.set_index(["line_id", "slot_id", "demand_id"])["sequence"].to_dict()
+
+    conflicts: list[tuple[str, str, str, str, str, int, int]] = []
+    for arc in data.fai_arcs.itertuples(index=False):
+        first_d = str(arc.first_demand_id)
+        rest_d = str(arc.rest_demand_id)
+        first_rows = sol[sol["demand_id"] == first_d][["line_id", "slot_id"]].drop_duplicates()
+        rest_rows = sol[sol["demand_id"] == rest_d][["line_id", "slot_id"]].drop_duplicates()
+        if first_rows.empty or rest_rows.empty:
+            continue
+        overlap = first_rows.merge(rest_rows, on=["line_id", "slot_id"], how="inner")
+        for row in overlap.itertuples(index=False):
+            key_first = (str(row.line_id), str(row.slot_id), first_d)
+            key_rest = (str(row.line_id), str(row.slot_id), rest_d)
+            seq_first = int(pos.get(key_first, 0))
+            seq_rest = int(pos.get(key_rest, 0))
+            if seq_first > 0 and seq_rest > 0 and seq_rest < seq_first:
+                conflicts.append((str(getattr(arc, "group_id", "")), first_d, rest_d, str(row.line_id), str(row.slot_id), seq_first, seq_rest))
+    if conflicts:
+        sample = "; ".join(
+            f"group={g} line={l} slot={s} first={f}@{sf} rest={r}@{sr}"
+            for g, f, r, l, s, sf, sr in conflicts[:5]
+        )
+        issues.append(
+            {
+                "level": "warning",
+                "where": "second_stage_fai_sort_conflict",
+                "message": f"{len(conflicts)} FAI same-slot order conflicts (lock/seq precedence kept); sample={sample}",
+            }
+        )
+    return int(len(conflicts))
+
+
+def _assign_timeline_with_fai_wait(solution: pd.DataFrame, data: ProcessedData) -> pd.DataFrame:
+    """v7.6 lightweight timeline with minute-level FAI wait insertion.
+
+    This does not change quantity/line/slot assignment. It only computes
+    start/end timestamps per row after sequencing.
+    """
+    out = solution.copy()
+    if out.empty:
+        out["schedule_start_time_calc"] = ""
+        out["schedule_end_time_calc"] = ""
+        out["fai_wait_minutes"] = 0.0
+        out["time_overrun_flag"] = 0
+        return out
+
+    out["shift_start_time"] = pd.to_datetime(out.get("shift_start_time"), errors="coerce")
+    out["shift_end_time"] = pd.to_datetime(out.get("shift_end_time"), errors="coerce")
+    out["schedule_qty"] = pd.to_numeric(out.get("schedule_qty", 0), errors="coerce").fillna(0.0)
+    out["uph"] = pd.to_numeric(out.get("uph", 0), errors="coerce").fillna(0.0)
+    out["sequence"] = pd.to_numeric(out.get("sequence", 0), errors="coerce").fillna(0).astype(int)
+    out["demand_id"] = out["demand_id"].astype(str)
+    out["line_id"] = out["line_id"].astype(str)
+    out["slot_id"] = out["slot_id"].astype(str)
+
+    # rest_demand -> list[(first_demand, lead_hours)]
+    incoming: dict[str, list[tuple[str, float]]] = {}
+    if not data.fai_arcs.empty:
+        for arc in data.fai_arcs.itertuples(index=False):
+            rest = str(arc.rest_demand_id)
+            first = str(arc.first_demand_id)
+            lead = float(getattr(arc, "lead_hours", 0.0) or 0.0)
+            incoming.setdefault(rest, []).append((first, lead))
+
+    ordered = out.sort_values(
+        ["shift_start_time", "line_id", "slot_id", "sequence", "demand_id"],
+        kind="mergesort",
+    ).copy()
+    finish_by_demand: dict[str, pd.Timestamp] = {}
+    starts: list[pd.Timestamp | pd.NaT] = []
+    ends: list[pd.Timestamp | pd.NaT] = []
+    waits: list[float] = []
+    overruns: list[int] = []
+
+    for _, group in ordered.groupby(["line_id", "slot_id"], sort=False):
+        cursor = pd.to_datetime(group["shift_start_time"].iloc[0], errors="coerce")
+        slot_end = pd.to_datetime(group["shift_end_time"].iloc[0], errors="coerce")
+        for row in group.itertuples(index=False):
+            base_start = cursor
+            demand_id = str(row.demand_id)
+            start = base_start
+            wait_minutes = 0.0
+            if demand_id in incoming and pd.notna(base_start):
+                required_times: list[pd.Timestamp] = []
+                for first_d, lead_h in incoming[demand_id]:
+                    finish_first = finish_by_demand.get(first_d)
+                    if finish_first is not None:
+                        required_times.append(pd.Timestamp(finish_first) + pd.Timedelta(hours=float(lead_h)))
+                if required_times:
+                    required = max(required_times)
+                    if pd.Timestamp(base_start) < required:
+                        start = required
+                        wait_minutes = max((required - pd.Timestamp(base_start)).total_seconds() / 60.0, 0.0)
+
+            uph = float(getattr(row, "uph", 0.0) or 0.0)
+            qty = float(getattr(row, "schedule_qty", 0.0) or 0.0)
+            duration = pd.Timedelta(hours=qty / uph) if uph > 0 and qty > 0 else pd.Timedelta(0)
+            end = start + duration if pd.notna(start) else pd.NaT
+            overrun = int(pd.notna(slot_end) and pd.notna(end) and end > slot_end + pd.Timedelta(seconds=1))
+
+            starts.append(start)
+            ends.append(end)
+            waits.append(wait_minutes)
+            overruns.append(overrun)
+
+            if pd.notna(end):
+                cursor = end
+                prev_finish = finish_by_demand.get(demand_id)
+                if prev_finish is None or pd.Timestamp(end) > pd.Timestamp(prev_finish):
+                    finish_by_demand[demand_id] = pd.Timestamp(end)
+
+    ordered["schedule_start_time_calc"] = [_format_datetime(ts) for ts in starts]
+    ordered["schedule_end_time_calc"] = [_format_datetime(ts) for ts in ends]
+    ordered["fai_wait_minutes"] = waits
+    ordered["time_overrun_flag"] = overruns
+    return ordered.sort_index()
 
 
 def _sort_columns_from_demands(data: ProcessedData) -> list[str]:
@@ -161,10 +320,12 @@ def _check_fai_precedence(solution: pd.DataFrame, data: ProcessedData, issues: l
     if data.fai_arcs.empty:
         return 0
     sol = solution.copy()
-    sol["shift_start_time"] = pd.to_datetime(sol["shift_start_time"], errors="coerce")
-    sol["shift_end_time"] = pd.to_datetime(sol["shift_end_time"], errors="coerce")
-    finish = sol.dropna(subset=["shift_end_time"]).groupby("demand_id")["shift_end_time"].max()
-    start = sol.dropna(subset=["shift_start_time"]).groupby("demand_id")["shift_start_time"].min()
+    start_col = "schedule_start_time_calc" if "schedule_start_time_calc" in sol.columns else "shift_start_time"
+    end_col = "schedule_end_time_calc" if "schedule_end_time_calc" in sol.columns else "shift_end_time"
+    sol[start_col] = pd.to_datetime(sol[start_col], errors="coerce")
+    sol[end_col] = pd.to_datetime(sol[end_col], errors="coerce")
+    finish = sol.dropna(subset=[end_col]).groupby("demand_id")[end_col].max()
+    start = sol.dropna(subset=[start_col]).groupby("demand_id")[start_col].min()
 
     violations = []
     for arc in data.fai_arcs.itertuples(index=False):
@@ -322,3 +483,9 @@ def _count_model_changeovers(frame: pd.DataFrame) -> int:
         return 0
     models = [str(m).strip() for m in frame["model"].fillna("").astype(str) if str(m).strip()]
     return sum(1 for prev, cur in zip(models, models[1:]) if prev != cur)
+
+
+def _format_datetime(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")

@@ -319,7 +319,15 @@ def _enrich_solution(
     out["shift"] = out["shift"].where(out["shift"].astype(str).ne(""), out["shift_seq"].astype(str))
     out["schedule_day"] = pd.to_datetime(out["day"], errors="coerce").dt.strftime("%Y-%m-%d")
     out["schedule_seq"] = out["sequence"].where(out["sequence"] > 0, out["seq"]).fillna(0).astype(int)
-    out = _assign_schedule_times(out)
+    # v7.6: second_stage may already provide timeline columns with FAI waits.
+    # Keep backward compatibility by falling back to legacy assignment when
+    # those columns are absent.
+    has_second_stage_timeline = {
+        "schedule_start_time_calc",
+        "schedule_end_time_calc",
+    }.issubset(set(out.columns))
+    if not has_second_stage_timeline:
+        out = _assign_schedule_times(out)
     return _empty_to_blank(out)
 
 
