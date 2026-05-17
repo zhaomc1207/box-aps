@@ -36,6 +36,7 @@ def run_second_stage(solution: pd.DataFrame, data: ProcessedData) -> SecondStage
     fai_sort_conflict_count = _check_fai_lock_seq_conflicts(sequenced, data, issues)
     split_count = _check_same_demand_same_slot_split(sequenced, issues)
     fai_count = _check_fai_precedence(sequenced, data, issues)
+    lock_consistency_count = _check_lock_consistency(sequenced, data, issues)
     capacity_count = _check_capacity(sequenced, data, issues)
     changeover_counts = _summarize_changeovers(sequenced, issues)
 
@@ -44,6 +45,7 @@ def run_second_stage(solution: pd.DataFrame, data: ProcessedData) -> SecondStage
             "same_demand_same_slot_split_count": split_count,
             "fai_sort_conflict_count": fai_sort_conflict_count,
             "fai_violation_count": fai_count,
+            "lock_consistency_violation_count": lock_consistency_count,
             "capacity_violation_slot_count": capacity_count,
             "time_overrun_row_count": int(
                 pd.to_numeric(sequenced.get("time_overrun_flag", 0), errors="coerce").fillna(0).astype(int).sum()
@@ -350,6 +352,47 @@ def _check_fai_precedence(solution: pd.DataFrame, data: ProcessedData, issues: l
             }
         )
     return int(len(violations))
+
+
+def _check_lock_consistency(solution: pd.DataFrame, data: ProcessedData, issues: list[dict[str, Any]]) -> int:
+    """Check FIX/adjust lock quantity consistency against second-stage solution."""
+    locks_frames: list[pd.DataFrame] = []
+    if len(data.fixed_locks):
+        locks_frames.append(data.fixed_locks.assign(_lock_source="fix"))
+    if len(data.adjust_locks):
+        locks_frames.append(data.adjust_locks.assign(_lock_source="adjust"))
+    if not locks_frames:
+        return 0
+    locks = pd.concat(locks_frames, ignore_index=True)
+    for col in ["demand_id", "line_id", "slot_id"]:
+        locks[col] = locks[col].astype(str)
+    lock_qty = pd.to_numeric(locks.get("lock_qty", 0), errors="coerce").fillna(0.0)
+    locks = locks.assign(lock_qty=lock_qty)
+    locks = locks[locks["lock_qty"] > 0].copy()
+    if locks.empty:
+        return 0
+
+    sol = solution.copy()
+    for col in ["demand_id", "line_id", "slot_id"]:
+        sol[col] = sol[col].astype(str)
+    sol["schedule_qty"] = pd.to_numeric(sol.get("schedule_qty", 0), errors="coerce").fillna(0.0)
+    actual = sol.groupby(["demand_id", "line_id", "slot_id"], as_index=False)["schedule_qty"].sum()
+    merged = locks.merge(actual, on=["demand_id", "line_id", "slot_id"], how="left")
+    merged["schedule_qty"] = merged["schedule_qty"].fillna(0.0)
+    bad = merged[merged["schedule_qty"] + 1e-6 < merged["lock_qty"]].copy()
+    if len(bad):
+        sample = "; ".join(
+            f"demand={r.demand_id} line={r.line_id} slot={r.slot_id} expected>={r.lock_qty:.3f} actual={r.schedule_qty:.3f}"
+            for r in bad.head(5).itertuples(index=False)
+        )
+        issues.append(
+            {
+                "level": "warning",
+                "where": "second_stage_lock_consistency",
+                "message": f"{len(bad)} lock rows are not satisfied by second-stage output; sample={sample}",
+            }
+        )
+    return int(len(bad))
 
 
 def _check_capacity(solution: pd.DataFrame, data: ProcessedData, issues: list[dict[str, Any]]) -> int:

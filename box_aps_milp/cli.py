@@ -180,7 +180,9 @@ def _main(argv: list[str] | None = None) -> int:
             parser.error("solve requires either --input or --processed")
         _print_summary(data)
         model, solution, summary = _solve_pipeline(data, args)
-        _write_lock_diagnostics(model, Path(args.summary).resolve().parent if args.summary else Path(args.output).resolve().parent)
+        audit_dir = Path(args.summary).resolve().parent if args.summary else Path(args.output).resolve().parent
+        _write_lock_diagnostics(model, audit_dir)
+        _write_second_stage_audits(solution, data, audit_dir)
         if args.summary:
             _write_json(args.summary, summary)
         output = Path(args.output)
@@ -225,6 +227,7 @@ def _main(argv: list[str] | None = None) -> int:
 
         model, solution, summary = _solve_pipeline(data, args)
         _write_lock_diagnostics(model, Path(args.processed).resolve())
+        _write_second_stage_audits(solution, data, Path(args.processed).resolve())
         solution_path = Path(args.solution)
         solution_path.parent.mkdir(parents=True, exist_ok=True)
         solution.to_csv(solution_path, index=False, encoding="utf-8-sig")
@@ -379,6 +382,99 @@ def _write_lock_diagnostics(model, output_dir: Path) -> None:
     lock_details = getattr(model, "_aps_lock_details", None)
     if isinstance(lock_details, pd.DataFrame) and len(lock_details):
         lock_details.to_csv(output_dir / "lock_details.csv", index=False, encoding="utf-8-sig")
+
+
+def _write_second_stage_audits(solution: pd.DataFrame, data, output_dir: Path) -> None:
+    """Write stage-5 audit CSVs: FAI calendar, lock consistency, time overrun."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if solution.empty:
+        return
+
+    sol = solution.copy()
+    for col in ["demand_id", "line_id", "slot_id"]:
+        if col in sol.columns:
+            sol[col] = sol[col].astype(str)
+
+    # 1) FAI calendar audit
+    if not data.fai_arcs.empty:
+        start_col = "schedule_start_time_calc" if "schedule_start_time_calc" in sol.columns else "shift_start_time"
+        end_col = "schedule_end_time_calc" if "schedule_end_time_calc" in sol.columns else "shift_end_time"
+        sol[start_col] = pd.to_datetime(sol[start_col], errors="coerce")
+        sol[end_col] = pd.to_datetime(sol[end_col], errors="coerce")
+        finish = sol.dropna(subset=[end_col]).groupby("demand_id")[end_col].max()
+        start = sol.dropna(subset=[start_col]).groupby("demand_id")[start_col].min()
+        rows: list[dict] = []
+        for arc in data.fai_arcs.itertuples(index=False):
+            first_d = str(arc.first_demand_id)
+            rest_d = str(arc.rest_demand_id)
+            if first_d not in finish.index or rest_d not in start.index:
+                continue
+            required = pd.Timestamp(finish.loc[first_d]) + pd.Timedelta(hours=float(arc.lead_hours))
+            actual = pd.Timestamp(start.loc[rest_d])
+            ok = int(actual + pd.Timedelta(seconds=1) >= required)
+            rows.append(
+                {
+                    "group_id": str(getattr(arc, "group_id", "")),
+                    "first_demand_id": first_d,
+                    "rest_demand_id": rest_d,
+                    "lead_hours": float(arc.lead_hours),
+                    "required_start_time": required.strftime("%Y-%m-%d %H:%M:%S"),
+                    "actual_start_time": actual.strftime("%Y-%m-%d %H:%M:%S"),
+                    "is_valid": ok,
+                }
+            )
+        pd.DataFrame(rows).to_csv(output_dir / "second_stage_fai_calendar_audit.csv", index=False, encoding="utf-8-sig")
+
+    # 2) lock consistency audit
+    locks_frames: list[pd.DataFrame] = []
+    if len(data.fixed_locks):
+        locks_frames.append(data.fixed_locks.assign(lock_source="fix"))
+    if len(data.adjust_locks):
+        locks_frames.append(data.adjust_locks.assign(lock_source="adjust"))
+    if locks_frames:
+        locks = pd.concat(locks_frames, ignore_index=True)
+        for col in ["demand_id", "line_id", "slot_id"]:
+            locks[col] = locks[col].astype(str)
+        locks["lock_qty"] = pd.to_numeric(locks.get("lock_qty", 0), errors="coerce").fillna(0.0)
+        locks = locks[locks["lock_qty"] > 0].copy()
+        if len(locks):
+            qty = (
+                sol.assign(schedule_qty=pd.to_numeric(sol.get("schedule_qty", 0), errors="coerce").fillna(0.0))
+                .groupby(["demand_id", "line_id", "slot_id"], as_index=False)["schedule_qty"]
+                .sum()
+            )
+            merged = locks.merge(qty, on=["demand_id", "line_id", "slot_id"], how="left")
+            merged["schedule_qty"] = merged["schedule_qty"].fillna(0.0)
+            merged["is_valid"] = (merged["schedule_qty"] + 1e-6 >= merged["lock_qty"]).astype(int)
+            merged.to_csv(output_dir / "second_stage_lock_consistency_audit.csv", index=False, encoding="utf-8-sig")
+
+    # 3) time overrun audit
+    if "time_overrun_flag" in sol.columns:
+        start_col = "schedule_start_time_calc" if "schedule_start_time_calc" in sol.columns else "shift_start_time"
+        end_col = "schedule_end_time_calc" if "schedule_end_time_calc" in sol.columns else "shift_end_time"
+        out = sol.copy()
+        out["time_overrun_flag"] = pd.to_numeric(out["time_overrun_flag"], errors="coerce").fillna(0).astype(int)
+        keep = out[out["time_overrun_flag"] > 0].copy()
+        if len(keep):
+            keep_cols = [
+                c
+                for c in [
+                    "demand_id",
+                    "line_id",
+                    "slot_id",
+                    "sequence",
+                    "schedule_qty",
+                    "uph",
+                    "shift_start_time",
+                    "shift_end_time",
+                    start_col,
+                    end_col,
+                    "fai_wait_minutes",
+                    "time_overrun_flag",
+                ]
+                if c in keep.columns
+            ]
+            keep[keep_cols].to_csv(output_dir / "second_stage_time_overrun_audit.csv", index=False, encoding="utf-8-sig")
 
 
 def _solve_with_optional_fai_repair(data, model_config: ModelConfig, fai_repair_iterations: int):
