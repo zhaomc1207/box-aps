@@ -100,6 +100,11 @@ class PreprocessConfig:
     max_lines_per_demand_day: int | None = 5
     max_slots_per_demand: int | None = 60
     bucket_after_days: int | None = 5
+    # v7.6: slot-level FAI capacity reservation B_{lt}^{fai}. Disabled by
+    # default to preserve backward compatibility with historical runs.
+    enable_fai_slot_buffer: bool = False
+    # Optional upper cap (minutes) for per-(line, slot) reservation.
+    fai_buffer_cap_minutes: float | None = None
 
 
 @dataclass(slots=True)
@@ -168,6 +173,8 @@ def load_processed_data(input_dir: str | Path) -> ProcessedData:
             "reserved_hours",
             "occupied_hours",
             "avail_hours",
+            "fai_buffer_hours",
+            "fai_buffer_minutes",
             "slot_rank",
             "non_merge_flag",
             "fix_type",
@@ -287,6 +294,15 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
         fixed_locks,
         adjust_locks,
     ) = _apply_day_buckets(triples, line_slots, slots, fixed_locks, adjust_locks, config)
+    # v7.6: optional FAI slot-level capacity reservation attached to line_slots.
+    line_slots = _apply_fai_slot_buffer(
+        line_slots=line_slots,
+        triples=triples,
+        fai_arcs=fai_arcs,
+        fixed_locks=fixed_locks,
+        adjust_locks=adjust_locks,
+        config=config,
+    )
     bucketed_triples = int(len(triples))
     logger.info(
         "preprocess:triples raw=%s pruned=%s bucketed=%s",
@@ -336,6 +352,10 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
             "ship2_ext_days": int(config.ship2_ext_days),
             "due_buffer_days_legacy": None if config.due_buffer_days is None else int(config.due_buffer_days),
             "kpi_cutoff_policy": "end_of_day",
+            "enable_fai_slot_buffer": bool(config.enable_fai_slot_buffer),
+            "fai_buffer_cap_minutes": (
+                None if config.fai_buffer_cap_minutes is None else float(config.fai_buffer_cap_minutes)
+            ),
         },
         "counts": {
             "raw_demands": int(len(raw_demands)),
@@ -350,6 +370,9 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
             "fixed_locks": int(len(fixed_locks)),
             "adjust_locks": int(len(adjust_locks)),
             "fai_arcs": int(len(fai_arcs)),
+            "fai_buffered_line_slots": int(
+                pd.to_numeric(line_slots.get("fai_buffer_hours", 0.0), errors="coerce").fillna(0.0).gt(0).sum()
+            ),
         },
     }
 
@@ -2172,6 +2195,121 @@ def _kpi_kept_reason(row: pd.Series) -> str:
     if int(row.get("keep_by_extended", 0) or 0) > 0:
         return "extended"
     return "fallback"
+
+
+def _apply_fai_slot_buffer(
+    line_slots: pd.DataFrame,
+    triples: pd.DataFrame,
+    fai_arcs: pd.DataFrame,
+    fixed_locks: pd.DataFrame,
+    adjust_locks: pd.DataFrame,
+    config: PreprocessConfig,
+) -> pd.DataFrame:
+    """Compute optional v7.6 B_{lt}^{fai} and attach to line_slots.
+
+    Rule: for each (line, slot), for each FAI group that has at least one
+    first-candidate and one rest-candidate on this slot, reserve this group's
+    max lead_hours on this slot; sum across groups.
+
+    Backward compatibility: when disabled, both columns are zero.
+    Lock-friendly policy: do not apply FAI buffer on slots that already carry
+    FIX/adjust locks, to reduce strict-lock infeasibility risk.
+    """
+    out = line_slots.copy()
+    out["fai_buffer_hours"] = 0.0
+    out["fai_buffer_minutes"] = 0.0
+    if not bool(config.enable_fai_slot_buffer):
+        return out
+    if out.empty or triples.empty or fai_arcs.empty:
+        return out
+
+    tri = triples[["demand_id", "line_id", "slot_id"]].copy()
+    for col in ["demand_id", "line_id", "slot_id"]:
+        tri[col] = tri[col].astype(str)
+    present = tri.drop_duplicates(["demand_id", "line_id", "slot_id"])
+
+    arcs = fai_arcs.copy()
+    for col in ["group_id", "first_demand_id", "rest_demand_id"]:
+        arcs[col] = arcs[col].astype(str)
+    arcs["lead_hours"] = pd.to_numeric(arcs["lead_hours"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    if arcs.empty:
+        return out
+
+    first_present = present.rename(columns={"demand_id": "first_demand_id"})[
+        ["first_demand_id", "line_id", "slot_id"]
+    ].copy()
+    rest_present = present.rename(columns={"demand_id": "rest_demand_id"})[
+        ["rest_demand_id", "line_id", "slot_id"]
+    ].copy()
+
+    hits = (
+        arcs.merge(first_present, on="first_demand_id", how="inner")
+        .merge(rest_present, on=["rest_demand_id", "line_id", "slot_id"], how="inner")
+    )
+    if hits.empty:
+        return out
+
+    group_slot = (
+        hits.groupby(["group_id", "line_id", "slot_id"], as_index=False)["lead_hours"]
+        .max()
+        .rename(columns={"lead_hours": "group_slot_fai_hours"})
+    )
+    slot_buffer = (
+        group_slot.groupby(["line_id", "slot_id"], as_index=False)["group_slot_fai_hours"]
+        .sum()
+        .rename(columns={"group_slot_fai_hours": "fai_buffer_hours"})
+    )
+
+    # Lock-friendly strategy: skip buffer on slots occupied by lock rows.
+    lock_slots = set()
+    for frame in [fixed_locks, adjust_locks]:
+        if frame is None or frame.empty:
+            continue
+        lock_slots.update(
+            (
+                str(r.line_id),
+                str(r.slot_id),
+            )
+            for r in frame[["line_id", "slot_id"]].dropna().itertuples(index=False)
+        )
+    if lock_slots:
+        before = len(slot_buffer)
+        slot_buffer = slot_buffer[
+            ~slot_buffer.apply(lambda r: (str(r["line_id"]), str(r["slot_id"])) in lock_slots, axis=1)
+        ].copy()
+        logger.info(
+            "preprocess:fai_slot_buffer lock_friendly filtered_slots=%s kept_slots=%s",
+            before - len(slot_buffer),
+            len(slot_buffer),
+        )
+
+    if config.fai_buffer_cap_minutes is not None:
+        cap_hours = max(float(config.fai_buffer_cap_minutes), 0.0) / 60.0
+        slot_buffer["fai_buffer_hours"] = slot_buffer["fai_buffer_hours"].clip(upper=cap_hours)
+
+    slot_buffer["fai_buffer_minutes"] = slot_buffer["fai_buffer_hours"] * 60.0
+    out = out.merge(slot_buffer, on=["line_id", "slot_id"], how="left", suffixes=("", "_calc"))
+    out["fai_buffer_hours"] = pd.to_numeric(
+        out.get("fai_buffer_hours_calc", out["fai_buffer_hours"]), errors="coerce"
+    ).fillna(out["fai_buffer_hours"])
+    out["fai_buffer_minutes"] = pd.to_numeric(
+        out.get("fai_buffer_minutes_calc", out["fai_buffer_minutes"]), errors="coerce"
+    ).fillna(out["fai_buffer_minutes"])
+    out = out.drop(columns=["fai_buffer_hours_calc", "fai_buffer_minutes_calc"], errors="ignore")
+
+    nonzero = out[pd.to_numeric(out["fai_buffer_hours"], errors="coerce").fillna(0.0) > 0.0][
+        ["line_id", "slot_id", "fai_buffer_hours", "fai_buffer_minutes"]
+    ]
+    if len(nonzero):
+        logger.info(
+            "preprocess:fai_slot_buffer enabled=%s nonzero_slots=%s sample=%s",
+            bool(config.enable_fai_slot_buffer),
+            len(nonzero),
+            nonzero.head(5).to_dict(orient="records"),
+        )
+    else:
+        logger.info("preprocess:fai_slot_buffer enabled=%s nonzero_slots=0", bool(config.enable_fai_slot_buffer))
+    return out
 
 
 def _build_priority(

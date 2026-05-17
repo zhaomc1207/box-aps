@@ -296,6 +296,17 @@ def _add_preprocess_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-lines-per-demand-day", type=int, default=5, help="Keep at most this many candidate lines per demand per day (v7_1 default: 5).")
     parser.add_argument("--max-slots-per-demand", type=int, default=60, help="Keep at most this many candidate line-slot columns per demand (v7_1 default: 60).")
     parser.add_argument("--bucket-after-days", type=int, default=5, help="Collapse shifts after this many days into line-day buckets (v7_1 default: 5).")
+    parser.add_argument(
+        "--enable-fai-slot-buffer",
+        action="store_true",
+        help="Enable v7.6 slot-level FAI capacity reservation B_{lt}^{fai} in preprocessing.",
+    )
+    parser.add_argument(
+        "--fai-buffer-cap-minutes",
+        type=float,
+        default=None,
+        help="Optional upper cap (minutes) for per-(line,slot) FAI buffer.",
+    )
 
 
 def _preprocess_config_from_args(args: argparse.Namespace) -> PreprocessConfig:
@@ -314,6 +325,8 @@ def _preprocess_config_from_args(args: argparse.Namespace) -> PreprocessConfig:
         max_lines_per_demand_day=args.max_lines_per_demand_day,
         max_slots_per_demand=args.max_slots_per_demand,
         bucket_after_days=args.bucket_after_days,
+        enable_fai_slot_buffer=getattr(args, "enable_fai_slot_buffer", False),
+        fai_buffer_cap_minutes=getattr(args, "fai_buffer_cap_minutes", None),
     )
 
 

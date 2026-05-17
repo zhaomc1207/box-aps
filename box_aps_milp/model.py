@@ -125,6 +125,11 @@ def build_gurobi_model(data: ProcessedData, config: ModelConfig | None = None):
     slot_end = slots.set_index("slot_id")["end_hour"].astype(float).to_dict()
     slot_rank = slots.set_index("slot_id")["slot_rank"].astype(int).to_dict()
     avail = line_slots.set_index(["line_id", "slot_id"])["avail_hours"].astype(float).to_dict()
+    # v7.6 optional FAI slot-level reservation loaded from preprocessing.
+    if "fai_buffer_hours" in line_slots.columns:
+        fai_buffer = line_slots.set_index(["line_id", "slot_id"])["fai_buffer_hours"].astype(float).to_dict()
+    else:
+        fai_buffer = {}
     uph = triples.set_index(["demand_id", "line_id", "slot_id"])["uph"].astype(float).to_dict()
     elig = triples.set_index(["demand_id", "line_id", "slot_id"])["elig"].astype(int).to_dict()
     line_cell = lines.set_index("line_id")["cell_flag"].astype(int).to_dict()
@@ -205,7 +210,10 @@ def build_gurobi_model(data: ProcessedData, config: ModelConfig | None = None):
     # 8.5 line/shift capacity.
     for key in line_slot_keys:
         lhs = gp.quicksum(x[t] / uph[t] for t in triples_by_line_slot.get(key, []) if uph.get(t, 0.0) > 0)
-        model.addConstr(lhs + setup[key] <= float(avail.get(key, 0.0)), name=f"capacity[{_key_name(key)}]")
+        model.addConstr(
+            lhs + setup[key] + float(fai_buffer.get(key, 0.0)) <= float(avail.get(key, 0.0)),
+            name=f"capacity[{_key_name(key)}]",
+        )
 
     # 8.8 delivery miss quantities.
     due_sets = _build_due_sets(
