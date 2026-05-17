@@ -131,6 +131,23 @@ RUNTIME_LOG_COLUMNS = [
     "updated_time",
 ]
 
+STAGE2_AUDIT_COLUMNS = [
+    "id",
+    "schedule_version",
+    "sub_schedule_version",
+    "line_id",
+    "slot_id",
+    "demand_id",
+    "schedule_seq",
+    "model",
+    "lot",
+    "fai_wait_minutes",
+    "time_overrun_flag",
+    "same_model_run",
+    "lot_break_flag",
+    "material_key_trace",
+]
+
 
 @dataclass(slots=True)
 class ExportConfig:
@@ -167,6 +184,7 @@ def build_export_artifacts(
     schedule_result = _build_schedule_result(enriched)
     demand_coverage = _build_demand_coverage(data, enriched, config)
     runtime_log = _build_runtime_log(enriched)
+    stage2_audit = _build_stage2_audit(enriched)
 
     tables = {
         "aps_adjust_schedule_output": adjust_output,
@@ -174,10 +192,12 @@ def build_export_artifacts(
         "aps_schedule_result": schedule_result,
         "aps_demand_coverage_output": demand_coverage,
         "aps_schedule_runtime_log": runtime_log,
+        "aps_schedule_stage2_audit": stage2_audit,
     }
     summary = {
         "coverage": _summarize_demand_coverage(demand_coverage),
         "changeovers": _summarize_change_line(change_line),
+        "stage2_timeline": _summarize_stage2_timeline(stage2_audit),
     }
     return ExportArtifacts(tables=tables, summary=summary)
 
@@ -507,6 +527,47 @@ def _build_runtime_log(enriched: pd.DataFrame) -> pd.DataFrame:
     return out[RUNTIME_LOG_COLUMNS]
 
 
+def _build_stage2_audit(enriched: pd.DataFrame) -> pd.DataFrame:
+    out = enriched.sort_values(["line_id", "slot_id", "schedule_seq", "demand_id"]).copy()
+    out["id"] = range(1, len(out) + 1)
+    out["schedule_seq"] = pd.to_numeric(out.get("schedule_seq", 0), errors="coerce").fillna(0).astype(int)
+    out["model"] = out.get("model", "").fillna("").astype(str)
+    out["lot"] = out.get("lot", "").fillna("").astype(str)
+    out["fai_wait_minutes"] = pd.to_numeric(out.get("fai_wait_minutes", 0.0), errors="coerce").fillna(0.0)
+    out["time_overrun_flag"] = pd.to_numeric(out.get("time_overrun_flag", 0), errors="coerce").fillna(0).astype(int)
+
+    run_ids = pd.Series(0, index=out.index, dtype="int64")
+    for _, group in out.groupby(["line_id", "slot_id"], sort=False):
+        prev_model = None
+        run_id = 0
+        for idx, model in zip(group.index, group["model"].tolist()):
+            m = str(model or "")
+            if m != prev_model:
+                run_id += 1
+            run_ids.loc[idx] = run_id
+            prev_model = m
+    out["same_model_run"] = run_ids.astype(int)
+
+    lot_break = pd.Series(0, index=out.index, dtype="int64")
+    for _, group in out.groupby(["line_id", "slot_id"], sort=False):
+        lots = group["lot"].fillna("").astype(str).tolist()
+        idxs = list(group.index)
+        for i, lot in enumerate(lots):
+            if not lot:
+                continue
+            if i > 0 and lots[i - 1] != lot and lot in lots[i + 1 :]:
+                lot_break.loc[idxs[i]] = 1
+    out["lot_break_flag"] = lot_break.astype(int)
+
+    key_cols = [c for c in ["kb", "log_up_assy", "cover_assy", "pcba", "thermal", "color"] if c in out.columns]
+    if key_cols:
+        out["material_key_trace"] = out[key_cols].fillna("").astype(str).agg("|".join, axis=1)
+    else:
+        out["material_key_trace"] = ""
+
+    return out[STAGE2_AUDIT_COLUMNS]
+
+
 def _assign_schedule_times(enriched: pd.DataFrame) -> pd.DataFrame:
     out = enriched.sort_values(["line_id", "slot_id", "schedule_seq", "demand_id"]).copy()
     starts: list[str] = []
@@ -652,4 +713,22 @@ def _summarize_change_line(frame: pd.DataFrame) -> dict[str, int]:
         "raw_changeovers": int(pd.to_numeric(frame["raw_times"], errors="coerce").fillna(0).sum()),
         "effective_changeovers": int(pd.to_numeric(frame["effective_times"], errors="coerce").fillna(0).sum()),
         "locked_changeovers": int(pd.to_numeric(frame["locked_changeovers"], errors="coerce").fillna(0).sum()),
+    }
+
+
+def _summarize_stage2_timeline(frame: pd.DataFrame) -> dict[str, float]:
+    if frame.empty:
+        return {
+            "rows": 0,
+            "fai_wait_minutes_total": 0.0,
+            "time_overrun_rows": 0,
+            "lot_break_rows": 0,
+            "same_model_runs_max": 0,
+        }
+    return {
+        "rows": int(len(frame)),
+        "fai_wait_minutes_total": float(pd.to_numeric(frame["fai_wait_minutes"], errors="coerce").fillna(0.0).sum()),
+        "time_overrun_rows": int(pd.to_numeric(frame["time_overrun_flag"], errors="coerce").fillna(0).astype(int).sum()),
+        "lot_break_rows": int(pd.to_numeric(frame["lot_break_flag"], errors="coerce").fillna(0).astype(int).sum()),
+        "same_model_runs_max": int(pd.to_numeric(frame["same_model_run"], errors="coerce").fillna(0).max()),
     }
