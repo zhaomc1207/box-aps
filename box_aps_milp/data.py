@@ -94,6 +94,11 @@ class PreprocessConfig:
     default_kpi_mode: str = "qtymax"
     # v7_1: relax candidate pruning to trade more solver time for tighter solutions.
     due_buffer_days: int | None = 3
+    # v7.6: KPI-specific timely buffers. When unset, fall back to due_buffer_days
+    # to preserve backward compatibility with historical preprocessing behavior.
+    ots_buffer_days: int | None = None
+    fpsd_buffer_days: int | None = None
+    ship2_buffer_days: int | None = None
     ots_ext_days: int = 3
     fpsd_ext_days: int = 3
     ship2_ext_days: int = 3
@@ -1899,14 +1904,15 @@ def _prune_sparse_triples(
     if triples.empty:
         return triples
     out = triples.copy()
-    missing_slot_cols = [col for col in ["shift_start_time", "start_hour"] if col not in out.columns]
+    missing_slot_cols = [col for col in ["shift_start_time", "shift_end_time", "start_hour"] if col not in out.columns]
     if missing_slot_cols:
         out = out.merge(
-            slots[["slot_id", "shift_start_time", "start_hour"]],
+            slots[["slot_id", "shift_start_time", "shift_end_time", "start_hour"]],
             on="slot_id",
             how="left",
         )
     out["shift_start_time"] = pd.to_datetime(out["shift_start_time"], errors="coerce")
+    out["shift_end_time"] = pd.to_datetime(out["shift_end_time"], errors="coerce")
     out = out.merge(
         demands[
             [
@@ -1925,44 +1931,49 @@ def _prune_sparse_triples(
     base_candidates = out.copy()
 
     due_buffer = int(config.due_buffer_days or 0)
+    ots_buffer = int(config.ots_buffer_days if config.ots_buffer_days is not None else due_buffer)
+    fpsd_buffer = int(config.fpsd_buffer_days if config.fpsd_buffer_days is not None else due_buffer)
+    ship2_buffer = int(config.ship2_buffer_days if config.ship2_buffer_days is not None else due_buffer)
     eod = pd.Timedelta(hours=23, minutes=59, seconds=59)
     # Vectorized KPI cutoffs: EndOfDay(due +/- days)
-    out["_ots_timely_cutoff"] = out["ots_date_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
-    out["_fpsd_timely_cutoff"] = out["fpsd_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
-    out["_ship2_timely_cutoff"] = out["ship_day_two_dt"].dt.normalize() + pd.to_timedelta(-due_buffer, unit="D") + eod
+    out["_ots_timely_cutoff"] = out["ots_date_dt"].dt.normalize() + pd.to_timedelta(-ots_buffer, unit="D") + eod
+    out["_fpsd_timely_cutoff"] = out["fpsd_dt"].dt.normalize() + pd.to_timedelta(-fpsd_buffer, unit="D") + eod
+    out["_ship2_timely_cutoff"] = out["ship_day_two_dt"].dt.normalize() + pd.to_timedelta(-ship2_buffer, unit="D") + eod
     out["_ots_ext_cutoff"] = out["ots_date_dt"].dt.normalize() + pd.to_timedelta(int(config.ots_ext_days), unit="D") + eod
     out["_fpsd_ext_cutoff"] = out["fpsd_dt"].dt.normalize() + pd.to_timedelta(int(config.fpsd_ext_days), unit="D") + eod
     out["_ship2_ext_cutoff"] = out["ship_day_two_dt"].dt.normalize() + pd.to_timedelta(int(config.ship2_ext_days), unit="D") + eod
 
+    # v7.6 consistency: main MILP treats slot completion at shift_end_time.
+    # Candidate timely/extended flags must use the same end-time semantics.
     out["is_ots_timely"] = (
         out["ots_date_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_ots_timely_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_ots_timely_cutoff"])
     ).astype(int)
     out["is_fpsd_timely"] = (
         out["fpsd_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_fpsd_timely_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_fpsd_timely_cutoff"])
     ).astype(int)
     out["is_ship2_timely"] = (
         out["ship_day_two_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_ship2_timely_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_ship2_timely_cutoff"])
     ).astype(int)
     out["is_ots_extended"] = (
         out["ots_date_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_ots_ext_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_ots_ext_cutoff"])
     ).astype(int)
     out["is_fpsd_extended"] = (
         out["fpsd_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_fpsd_ext_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_fpsd_ext_cutoff"])
     ).astype(int)
     out["is_ship2_extended"] = (
         out["ship_day_two_dt"].isna()
-        | out["shift_start_time"].isna()
-        | (out["shift_start_time"] <= out["_ship2_ext_cutoff"])
+        | out["shift_end_time"].isna()
+        | (out["shift_end_time"] <= out["_ship2_ext_cutoff"])
     ).astype(int)
     out["keep_by_timely"] = (
         (out["is_ots_timely"] > 0) | (out["is_fpsd_timely"] > 0) | (out["is_ship2_timely"] > 0)
