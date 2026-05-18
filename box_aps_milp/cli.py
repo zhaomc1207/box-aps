@@ -310,6 +310,12 @@ def _add_preprocess_args(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Optional upper cap (minutes) for per-(line,slot) FAI buffer.",
     )
+    parser.add_argument(
+        "--fai-buffer-policy",
+        choices=["strict", "lock_friendly"],
+        default="lock_friendly",
+        help="FAI slot-buffer policy: strict applies all eligible slots; lock_friendly skips lock-occupied slots.",
+    )
 
 
 def _preprocess_config_from_args(args: argparse.Namespace) -> PreprocessConfig:
@@ -329,6 +335,7 @@ def _preprocess_config_from_args(args: argparse.Namespace) -> PreprocessConfig:
         max_slots_per_demand=args.max_slots_per_demand,
         bucket_after_days=args.bucket_after_days,
         enable_fai_slot_buffer=getattr(args, "enable_fai_slot_buffer", False),
+        fai_buffer_policy=getattr(args, "fai_buffer_policy", "lock_friendly"),
         fai_buffer_cap_minutes=getattr(args, "fai_buffer_cap_minutes", None),
     )
 

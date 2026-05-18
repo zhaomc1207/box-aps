@@ -103,6 +103,9 @@ class PreprocessConfig:
     # v7.6: slot-level FAI capacity reservation B_{lt}^{fai}. Disabled by
     # default to preserve backward compatibility with historical runs.
     enable_fai_slot_buffer: bool = False
+    # v7.6 strategy switch: "strict" applies slot buffer to all eligible slots,
+    # while "lock_friendly" skips slots that already carry lock rows.
+    fai_buffer_policy: str = "lock_friendly"
     # Optional upper cap (minutes) for per-(line, slot) reservation.
     fai_buffer_cap_minutes: float | None = None
 
@@ -353,6 +356,7 @@ def build_processed_data(input_xlsx: str | Path, config: PreprocessConfig | None
             "due_buffer_days_legacy": None if config.due_buffer_days is None else int(config.due_buffer_days),
             "kpi_cutoff_policy": "end_of_day",
             "enable_fai_slot_buffer": bool(config.enable_fai_slot_buffer),
+            "fai_buffer_policy": str(config.fai_buffer_policy),
             "fai_buffer_cap_minutes": (
                 None if config.fai_buffer_cap_minutes is None else float(config.fai_buffer_cap_minutes)
             ),
@@ -2260,28 +2264,36 @@ def _apply_fai_slot_buffer(
         .rename(columns={"group_slot_fai_hours": "fai_buffer_hours"})
     )
 
-    # Lock-friendly strategy: skip buffer on slots occupied by lock rows.
-    lock_slots = set()
-    for frame in [fixed_locks, adjust_locks]:
-        if frame is None or frame.empty:
-            continue
-        lock_slots.update(
-            (
-                str(r.line_id),
-                str(r.slot_id),
+    policy = str(getattr(config, "fai_buffer_policy", "lock_friendly") or "lock_friendly").strip().lower()
+    if policy not in {"strict", "lock_friendly"}:
+        logger.warning("preprocess:fai_slot_buffer unknown policy=%s, fallback=lock_friendly", policy)
+        policy = "lock_friendly"
+
+    if policy == "lock_friendly":
+        lock_slots = set()
+        for frame in [fixed_locks, adjust_locks]:
+            if frame is None or frame.empty:
+                continue
+            lock_slots.update(
+                (
+                    str(r.line_id),
+                    str(r.slot_id),
+                )
+                for r in frame[["line_id", "slot_id"]].dropna().itertuples(index=False)
             )
-            for r in frame[["line_id", "slot_id"]].dropna().itertuples(index=False)
-        )
-    if lock_slots:
-        before = len(slot_buffer)
-        slot_buffer = slot_buffer[
-            ~slot_buffer.apply(lambda r: (str(r["line_id"]), str(r["slot_id"])) in lock_slots, axis=1)
-        ].copy()
-        logger.info(
-            "preprocess:fai_slot_buffer lock_friendly filtered_slots=%s kept_slots=%s",
-            before - len(slot_buffer),
-            len(slot_buffer),
-        )
+        if lock_slots:
+            before = len(slot_buffer)
+            slot_buffer = slot_buffer[
+                ~slot_buffer.apply(lambda r: (str(r["line_id"]), str(r["slot_id"])) in lock_slots, axis=1)
+            ].copy()
+            logger.info(
+                "preprocess:fai_slot_buffer policy=%s filtered_slots=%s kept_slots=%s",
+                policy,
+                before - len(slot_buffer),
+                len(slot_buffer),
+            )
+    else:
+        logger.info("preprocess:fai_slot_buffer policy=%s applies buffer on all eligible slots", policy)
 
     if config.fai_buffer_cap_minutes is not None:
         cap_hours = max(float(config.fai_buffer_cap_minutes), 0.0) / 60.0
@@ -2302,13 +2314,18 @@ def _apply_fai_slot_buffer(
     ]
     if len(nonzero):
         logger.info(
-            "preprocess:fai_slot_buffer enabled=%s nonzero_slots=%s sample=%s",
+            "preprocess:fai_slot_buffer enabled=%s policy=%s nonzero_slots=%s sample=%s",
             bool(config.enable_fai_slot_buffer),
+            policy,
             len(nonzero),
             nonzero.head(5).to_dict(orient="records"),
         )
     else:
-        logger.info("preprocess:fai_slot_buffer enabled=%s nonzero_slots=0", bool(config.enable_fai_slot_buffer))
+        logger.info(
+            "preprocess:fai_slot_buffer enabled=%s policy=%s nonzero_slots=0",
+            bool(config.enable_fai_slot_buffer),
+            policy,
+        )
     return out
 
 
